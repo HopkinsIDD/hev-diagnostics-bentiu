@@ -1,0 +1,1525 @@
+------
+title: "Public code_AFT"
+author: "Aybüke Koyuncu"
+date: "2025-03-21"
+output: html_document
+------
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Loading packages and data 
+library(here)
+library(gtsummary)
+library(knitr)
+library(cowplot)
+library(stringr)
+library(bayesplot)
+library(icenReg)
+library(dplyr)
+library(epiR)
+library(janitor)
+library(tidyr)
+library(ggplot2)
+library(readr)
+
+# Load data
+cases_table1  <- read_csv(here("scripts/Diagnostics/For Git/dat_minimal.csv"))
+
+```
+
+Replicate Table 1 for only the individuals who had repeated testing. 
+
+```{r table 1 lab}
+
+lab_data <- cases_table1 %>% filter(fup_bin==1)
+
+# Case type at baseline
+tabyl(lab_data$case_type_gran)
+
+# Sex 
+tabyl(lab_data$id_sex)
+tabyl(lab_data, case_type_gran, id_sex)
+tabyl(lab_data, case_type_gran, id_sex) %>% adorn_percentages("row")
+
+# Age
+summary(lab_data$age)
+
+lab_data %>%
+  group_by(case_type_gran) %>%
+  summarize(
+    med = median(age),
+    Q1 = quantile(age, 0.25),
+    Q3 = quantile(age, 0.75))
+
+# Combine 6-10 and 11-15 age categories
+lab_data <- lab_data %>% mutate(age_bin = case_when(
+  age_group_simple=="6-10" | age_group_simple=="11-15" ~ "6-15",
+TRUE ~ age_group_simple))
+
+tabyl(lab_data, age_bin)
+tabyl(lab_data, age_bin, case_type_gran)
+tabyl(lab_data, age_bin, case_type_gran) %>% adorn_percentages("col")
+
+# Days since AJS onset at baseline
+summary(lab_data$days_since_ajs_baseline)
+
+lab_data %>%
+  group_by(case_type_gran) %>%
+  summarize(
+    med = median(days_since_ajs_baseline, na.rm=TRUE),
+    Q1 = quantile(days_since_ajs_baseline, 0.25, na.rm=TRUE),
+    Q3 = quantile(days_since_ajs_baseline, 0.75, na.rm=TRUE))
+
+lab_data <- lab_data %>% mutate(days_since_ajs_bin2 = case_when(
+  days_since_ajs_baseline<=7 ~ "≤ 1 week",
+  days_since_ajs_baseline>7 & days_since_ajs_baseline<=14 ~ ">1 week to 2 weeks",
+  days_since_ajs_baseline>14 & days_since_ajs_baseline<=30 ~ ">2 weeks to 1 month",
+  days_since_ajs_baseline>30 & days_since_ajs_baseline<=60 ~ ">1 month to 2 months",
+  days_since_ajs_baseline>60 & is.na(days_since_ajs_baseline)==FALSE ~ ">2 months",
+TRUE ~ NA_character_
+))
+
+tabyl(lab_data$days_since_ajs_bin2)
+
+tabyl(lab_data, days_since_ajs_bin2, case_type_gran)
+lab_data %>% tabyl(days_since_ajs_bin2, case_type_gran) %>% adorn_percentages("col")
+
+# Days since AJS at follow-up
+summary(lab_data$days_since_ajs_fup)
+
+# ALT
+tabyl(lab_data$alt_class)
+lab_data %>% filter(is.na(alt_class)==FALSE) %>% tabyl(alt_class, case_type_gran)
+lab_data %>% filter(is.na(alt_class)==FALSE) %>% tabyl(alt_class, case_type_gran) %>% adorn_percentages("col")
+
+# AST
+tabyl(lab_data$ast_class)
+lab_data %>% filter(is.na(ast_class)==FALSE) %>% tabyl(ast_class, case_type_gran)
+lab_data %>% filter(is.na(ast_class)==FALSE) %>% tabyl(ast_class, case_type_gran) %>% adorn_percentages("col")
+
+# PCR at follow-up
+tabyl(lab_data$fup_pcr_result)
+tabyl(lab_data, fup_pcr_result, case_type_gran)
+tabyl(lab_data, fup_pcr_result, case_type_gran) %>% adorn_percentages("col")
+
+# ELISA at follow-up
+tabyl(lab_data$fup_igm_result)
+tabyl(lab_data, fup_igm_result, case_type_gran)
+tabyl(lab_data, fup_igm_result, case_type_gran) %>% adorn_percentages("col")
+
+# Hospitalizations
+tabyl(lab_data$case_admit)
+tabyl(lab_data, case_admit, case_type_gran)
+tabyl(lab_data, case_admit, case_type_gran) %>% adorn_percentages("col")
+
+# Deaths
+# Important note: outcomes are only available for those who were admitted
+lab_data <- lab_data %>% mutate(deaths = case_when(
+case_outcome==3 ~ 1,
+TRUE ~ 0))
+
+tabyl(lab_data$deaths)
+tabyl(lab_data, deaths, case_type_gran)
+tabyl(lab_data, deaths, case_type_gran) %>% adorn_percentages("col")
+
+# How many were PCR+ at baseline
+tabyl(lab_data$baseline_pcr_result)
+
+# Among those PCR positive at baseline, how many were still positive at fup
+lab_data %>% filter(baseline_pcr_result==1) %>% tabyl(fup_pcr_result)
+
+# How many were ELISA IgM+ at baseline
+tabyl(lab_data$baseline_igm_result)
+
+# Among those ELISA positive at baseline, how many were still positive at fup
+lab_data %>% filter(baseline_igm_result==1) %>% tabyl(fup_igm_result)
+
+
+```
+
+Create the dataset of PCR results only for people who were PCR positive at baseline:
+
+```{r pcr analysis}
+
+# Focus on participants that were positive at baseline
+pcr_data <- cases_table1 %>% filter(baseline_pcr_result==1)
+
+# Make sure nobody has a date>365
+summary(pcr_data$days_since_ajs_baseline)
+summary(pcr_data$days_since_ajs_fup)
+
+# Transform to long dataset
+# rename variables for easier pivoting
+pcr_data <- pcr_data %>% rename(baseline_days_since_ajs=days_since_ajs_baseline,
+                                fup_days_since_ajs=days_since_ajs_fup)
+
+pcr_long <- pcr_data %>% dplyr::select(baseline_days_since_ajs, fup_days_since_ajs, baseline_pcr_result, fup_pcr_result, fup_bin, pat_id)
+
+pcr_long_pos <- pcr_long %>% filter(baseline_pcr_result==1 & fup_pcr_result==1)
+
+pcr_long <- pcr_long %>%
+  pivot_longer(
+    cols = c(baseline_days_since_ajs, baseline_pcr_result, fup_days_since_ajs, fup_pcr_result),
+    names_to = c("timepoint", ".value"),
+ names_pattern = "(baseline|fup)_(.*)")
+
+pcr_long_pos <- pcr_long_pos %>%
+  pivot_longer(
+    cols = c(baseline_days_since_ajs, baseline_pcr_result, fup_days_since_ajs, fup_pcr_result),
+    names_to = c("timepoint", ".value"),
+ names_pattern = "(baseline|fup)_(.*)")
+
+# Create a char version of PCR results
+pcr_long <- pcr_long %>% mutate(
+  pcr_char= case_when(
+  pcr_result==0 ~ "Negative",
+  pcr_result==1 ~ "Positive",
+  TRUE ~ NA_character_))
+
+pcr_long_pos <- pcr_long_pos %>% mutate(pcr_char= case_when(
+  pcr_result==0 ~ "Negative",
+  pcr_result==1 ~ "Positive",
+  TRUE ~ NA_character_))
+
+pcr_long <- pcr_long %>%
+  mutate(fup_result_type = case_when(
+    timepoint == "fup" & pcr_char == "Positive" ~ "Positive",
+    timepoint == "fup" & pcr_char == "Negative" ~ "Negative",
+    TRUE ~ NA_character_
+  ))
+
+# Order by follow-up test result then sort by days since ajs
+pcr_long <- pcr_long %>%
+  mutate(
+    fup_sort_order = ifelse(fup_result_type == "Negative", 1, 2)
+  ) %>%
+  arrange(fup_sort_order, desc(days_since_ajs))
+
+# need this step to ensure it plots correctly
+pcr_long <- pcr_long %>%
+  mutate(pat_id = factor(pat_id, levels = unique(pat_id)))
+
+# For participants who were positive at both time points, only sort by days since ajs
+pcr_long_pos <- pcr_long_pos %>%
+  arrange(desc(days_since_ajs))
+
+# need this step to ensure it plots correctly
+pcr_long_pos <- pcr_long_pos %>%
+  mutate(pat_id = factor(pat_id, levels = unique(pat_id)))
+
+# BEFORE PLOTTING NEED TO REMOVE PEOPLE WHO DON'T HAVE A FUP VISIT #
+pcr_long <- pcr_long %>% filter(fup_bin==1)
+pcr_long_pos <- pcr_long_pos %>% filter(fup_bin==1)
+
+# Cohort plot
+cohort_plot_pcr <- ggplot(pcr_long, aes(x = days_since_ajs, y = pat_id, group = pat_id)) +
+  geom_line(color="indianred3") +
+  geom_point(
+    data = pcr_long,
+    aes(color = pcr_char),
+    shape = 16, size = 2
+  ) +
+  # Customize the colors manually
+  scale_color_manual(values = c("Positive" = "indianred3", "Negative" = "black"),
+          limits = c("Positive", "Negative")) + # this changes order
+  # Set x-axis ticks to show every 20 days
+  scale_x_continuous(breaks = seq(0, max(pcr_long$days_since_ajs, na.rm = TRUE), by = 20)) +
+  # Change axis labels and legend title
+  labs(x = "Days since jaundice onset", y = "Participant", color = "PCR Result") +
+  # Modify the theme to show the x-axis line and adjust text angles
+  theme_minimal() + ggtitle("A") +
+  theme(
+    #axis.text.y = element_text(size = 3),  # Adjust the size as needed
+    axis.text.x = element_text(angle = 25),  # Rotate x-axis labels
+    panel.grid = element_blank(),  # Remove all grid lines
+    panel.border = element_blank(),  # Remove plot border 
+    axis.text.y=element_blank(),  #remove y axis labels
+    axis.ticks.y=element_blank()  #remove y axis ticks
+  )
+
+# Now zoom in on the folks that stayed positive the entire time 
+
+cohort_plot_pcr_pos <- ggplot(pcr_long_pos, aes(x = days_since_ajs, y = pat_id, group = pat_id)) +
+  geom_line(color="indianred3") +
+  geom_point(
+    data = pcr_long_pos,
+    aes(color = pcr_char),
+    shape = 16, size = 2
+  ) +
+  # Customize the colors manually
+  scale_color_manual(values = c("Positive" = "indianred3", "Negative" = "black"), 
+ limits = c("Positive", "Negative")) + # this changes order
+  # Change axis labels and legend title
+  labs(x = "Days since jaundice onset", y = "Participant") +
+  # Modify the theme to show the x-axis line and adjust text angles
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 25),  # Rotate x-axis labels
+    panel.grid = element_blank(),  # Remove all grid lines
+    panel.border = element_blank(), # Remove plot border
+    axis.text.y=element_blank(),  #remove y axis labels
+    axis.ticks.y=element_blank(),  #remove y axis ticks
+    legend.position="none") 
+
+```
+
+Accelerated failure time model for PCR:
+
+```{r afd pcr}
+
+pcr_data <- pcr_data %>% mutate(l = as.numeric(baseline_days_since_ajs),
+                                r = as.numeric(fup_days_since_ajs))
+
+pcr_data <- pcr_data %>% mutate(
+  l= case_when(
+      fup_pcr_result==1 ~ r,
+      TRUE ~ l),
+  r= case_when(
+      fup_pcr_result==0 ~ r,
+      TRUE ~ Inf
+))
+
+# Data check
+pcr_data <- pcr_data %>% mutate(flag=ifelse(l>r,1,0))
+tabyl(pcr_data$flag)
+
+# NON PARAMETRIC MODELS
+np_fit <- ic_np(cbind(l, r) ~ 0, data = pcr_data)
+summary(np_fit)
+getSCurves(np_fit, newdata = NULL)
+
+plot(np_fit, xlab = 'Days since jaundice onset', ylab = 'Estimated Survival')
+
+# Data for Turnbull intervals
+
+# Should be 13 vertical lines
+vertical <- data.frame(
+  x = c(11, 12, 14, 15, 16, 17, 18, 21, 22, 26, 27, 37, 42),
+  y_start = c(1.00000000, 1.00000000, 0.8906351, 0.8906351, 0.8062453, 0.8062453, 0.5000000, 0.3690890, 0.3690890, 0.2105263, 0.2105263,0.1119030, 0.1119030),
+  y_end = c(0.8906351, 0.8906351, 0.8062453, 0.8062453, 0.5000000, 0.3690890, 0.3690890, 0.2105263, 0.2105263, 0.1119030, 0.1119030,0, 0))
+
+# Now just need to add the horizontal lines
+horizontal <- data.frame(
+  x_start = c(0, 11, 14, 16, 17, 21, 26, 37),
+  x_end = c(12, 15, 17, 18, 22, 27, 42, 42),
+  y = c(1.00000000, 0.8906351, 0.8062453, 0.5000000, 0.3690890, 0.2105263, 0.1119030, 0)
+)
+
+# Add shading for the rectangles
+shading_area <- data.frame(
+x_start = c(11, 14, 16, 17, 21, 26, 37),
+x_end = c(12, 15, 17, 18, 22, 27, 42),
+  y_start = c(1, 0.8906351, 0.8062453, 0.5000000, 0.3690890,0.2105263,0.1119030 ),
+  y_end = c(0.8906351, 0.8062453, 0.5000000, 0.3690890, 0.2105263,0.1119030, 0))
+
+# Create the plot
+nonparam_plot <- ggplot() +
+  geom_segment(data = vertical, 
+               aes(x = x, y = y_start, yend = y_end), 
+               size = 1, color = "blue") +
+  geom_segment(data = horizontal, 
+               aes(x = x_start, xend=x_end, y = y), 
+               size = 1, color = "blue") +
+  geom_rect(data = shading_area, 
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end), 
+            fill = "blue", alpha = 0.5) + # Adjust fill color and transparency
+  labs(x = "Days Since Jaundice Onset",
+       y = "Probability of Viremia") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  theme_minimal()
+
+# PARAMETRIC MODELS
+# Unadjusted model: 
+
+fit_lnorm_pcr <- ic_par(cbind(l, r) ~ NULL , data = pcr_data, dist = 'lnorm',
+model = 'aft')
+summary(fit_lnorm_pcr)
+plot(fit_lnorm_pcr)
+
+fit_gamma_pcr <- ic_par(cbind(l, r) ~ NULL ,data = pcr_data, dist = 'gamma',
+model = 'aft')
+summary(fit_gamma_pcr)
+plot(fit_gamma_pcr)
+
+fit_weib_pcr <- ic_par(cbind(l, r) ~ NULL ,data = pcr_data, dist = 'weibull',
+model = 'aft')
+summary(fit_weib_pcr) # dispersion is exp(log_shape)
+confint(fit_weib_pcr)
+plot(fit_weib_pcr)
+
+# Compare AIC 
+# Get the number of estimated parameters 
+n_params_lnorm_pcr <- length(coef(fit_lnorm_pcr))  # Number of coefficients in the model
+n_params_gamma_pcr <- length(coef(fit_gamma_pcr))
+n_params_weib_pcr <- length(coef(fit_weib_pcr))
+
+# Calculate AIC manually using log-likelihood from model summary
+aic_lnorm_pcr <- 2 * n_params_lnorm_pcr - (2 * -39.68719) 
+aic_gamma_pcr <- 2 * n_params_gamma_pcr - (2 * -40.77151)
+aic_weib_pcr <- 2 * n_params_weib_pcr - (2 * -43.87261)
+
+# Compare AIC values
+aic_values_pcr <- c(lnorm = aic_lnorm_pcr, gamma = aic_gamma_pcr, weib = aic_weib_pcr)
+best_model_pcr <- names(aic_values_pcr)[which.min(aic_values_pcr)]
+cat("Best model based on AIC: ", best_model_pcr, "\n")
+
+# BEST FITTING MODEL FOR PCR: log-normal
+
+# See if age and sex are associated with failure time: they are not
+fit_adjusted_sex <- ic_par(cbind(l, r) ~ id_sex,
+data = pcr_data, dist = 'lnorm',
+model = 'aft')
+
+summary(fit_adjusted_sex)
+
+# Categorical
+fit_adjusted_age <- ic_par(cbind(l, r) ~ age_group_simple,
+data = pcr_data, dist = 'lnorm',
+model = 'aft')
+summary(fit_adjusted_age)
+
+# # Try under 5 and over five
+pcr_data <- pcr_data %>% mutate(age5 = ifelse(age<=5,1,0))
+fit_adjusted_agebin5 <- ic_par(cbind(l, r) ~ age5,
+data = pcr_data, dist = 'lnorm',
+model = 'aft')
+summary(fit_adjusted_agebin5)
+
+# # Continuous
+fit_adjusted_age <- ic_par(cbind(l, r) ~ age,
+data = pcr_data, dist = 'lnorm',
+model = 'aft')
+
+plot(fit_adjusted_age)
+
+fit_adjusted_age_sex <- ic_par(cbind(l, r) ~ age_group_simple + id_sex,
+data = pcr_data, dist = 'lnorm',
+model = 'aft')
+
+summary(fit_adjusted_age_sex)
+plot(fit_adjusted_age)
+
+# Create a sequence of time points for predictions
+time_points_pcr <- seq(0, 45, length.out = 100)
+
+# Number of bootstrap samples
+n_boot <- 100
+
+# Initialize matrix to store survival probabilities from each bootstrap iteration
+survival_boot_pcr <- matrix(NA, nrow = n_boot, ncol = length(time_points_pcr))
+
+median_times_pcr <- numeric(n_boot)  # Initialize with NA values
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Log-normal bootstrap calculation
+
+# Perform bootstrapping for log-normal model
+for (i in 1:n_boot) {
+  # Resample data with replacement
+  bootstrap_sample <- pcr_data[sample(1:nrow(pcr_data), replace = TRUE), ]
+  
+  # Fit the log-normal model on the bootstrap sample
+  fit_boot <- tryCatch({
+    ic_par(cbind(l, r) ~ NULL, data = bootstrap_sample, dist = 'lnorm', model = 'aft')
+  }, error = function(e) NULL)
+  
+  # Skip iteration if fit fails
+  if (is.null(fit_boot)) next
+  
+  # Extract log_scale and log_shape from the bootstrapped fit
+  log_mu_boot <- coef(fit_boot)["mu"]
+  log_sigma_boot <- exp(coef(fit_boot)["log_s"])
+
+  
+  # Calculate median time to failure for this bootstrap sample (log-normal)
+  median_times_pcr[i] <- exp(log_mu_boot)  # Median for log-normal is exp(mu)
+  survival_boot_pcr[i, ] <- 1 - plnorm(time_points_pcr, meanlog = log_mu_boot, sdlog = log_sigma_boot)
+
+}
+
+ci_lower_pcr <- quantile(median_times_pcr, 0.025)
+ci_upper_pcr <- quantile(median_times_pcr, 0.975)
+
+median(median_times_pcr)
+cat("95% Confidence Interval for the Median Time to Failure: [", ci_lower_pcr, ", ", ci_upper_pcr, "]\n")
+
+# Combine results into a data frame for plotting
+# Now calculate the mean and CI for the survival curve
+survival_median_pcr <- apply(survival_boot_pcr, 2, median)
+survival_lower_pcr <- apply(survival_boot_pcr, 2, function(x) quantile(x, 0.025))
+survival_upper_pcr <- apply(survival_boot_pcr, 2, function(x) quantile(x, 0.975))
+
+# Combine results into a data frame for plotting
+survival_df_pcr <- data.frame(
+  time = time_points_pcr,
+  survival_median = survival_median_pcr,
+  survival_lower = survival_lower_pcr,
+  survival_upper = survival_upper_pcr
+)
+
+# Convert to long dataset so I can plot all 100 curves
+# Convert survival_boot_pcr to a data frame, setting column names as time points
+survival_boot_df <- as.data.frame(survival_boot_pcr)
+colnames(survival_boot_df) <- time_points_pcr  # Set the column names to time points
+survival_boot_df$bootstrap <- 1:nrow(survival_boot_df)  # Add a column for bootstrap index
+
+# Pivot to long format
+survival_boot_long <- survival_boot_df %>%
+  pivot_longer(
+    cols = -bootstrap, 
+    names_to = "time", 
+    values_to = "survival"
+  ) %>%
+  mutate(time = as.numeric(time))  # Convert time from character to numeric
+
+
+# Plot the survival curve with confidence intervals
+plot_lnorm_pcr <- ggplot() +
+ geom_line(data = survival_boot_long, aes(x = time, y = survival, group = bootstrap), 
+            color = "grey", alpha = 0.5) +
+  geom_line(data = survival_df_pcr, aes(x = time, y = survival_median), color = "blue", size = 1) +
+
+  # # Add vertical segments
+  geom_segment(data = vertical,
+               aes(x = x, y = y_start, xend = x, yend = y_end),
+               size = 1, color = "palegreen3") +
+
+  # Add horizontal segments
+  geom_segment(data = horizontal,
+               aes(x = x_start, xend = x_end, y = y, yend = y),
+               size = 1, color = "palegreen3") +
+
+  # Add shading area
+  geom_rect(data = shading_area,
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end),
+            fill = "palegreen3", alpha = 0.5) +
+  
+  # Add labels and theme
+  labs(x = "Days since jaundice onset", y = "Probability of having a PCR positive result") +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank()   # Remove minor gridlines
+  ) + ggtitle("B") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1))
+
+plot_lnorm_pcr
+
+```
+
+Sensitivity analyses: get the median and dispersion for the other models (weibull, gamma)
+
+```{r pcr_weib}
+median_pcr_weib <- numeric(n_boot)  # Initialize for storing median times
+
+# Function to compute Weibull survival probabilities
+weibull_survival <- function(time, log_scale, log_shape) {
+  shape <- exp(log_shape)
+  scale <- exp(log_scale)
+  pweibull(time, shape = shape, scale = scale, lower.tail = FALSE)
+}
+
+# Perform bootstrapping
+for (i in 1:n_boot) {
+
+  # Resample data with replacement
+  bootstrap_sample <- pcr_data[sample(1:nrow(pcr_data), replace = TRUE), ]
+
+  # Fit the Weibull model on the bootstrap sample
+  fit_boot <- tryCatch({
+    ic_par(cbind(l, r) ~ NULL, data = bootstrap_sample, dist = 'weibull', model = 'aft')
+  }, error = function(e) NULL)
+
+  # Skip iteration if fit fails
+  if (is.null(fit_boot)) next
+
+  # Extract log_scale and log_shape from the bootstrapped fit
+  log_scale_boot <- coef(fit_boot)["log_scale"]
+  log_shape_boot <- coef(fit_boot)["log_shape"]
+
+    # Compute scale and shape
+  scale_boot <- exp(log_scale_boot)
+  shape_boot <- exp(log_shape_boot)
+
+  # Calculate median time to failure for this bootstrap sample
+  median_pcr_weib[i] <- scale_boot * (log(2))^(1 / shape_boot)
+
+  # Calculate survival probabilities for the current bootstrap sample
+  survival_boot_pcr[i, ] <- weibull_survival(time_points_pcr, log_scale_boot, log_shape_boot)
+}
+
+# Median time to failure and confidence interval
+# Calculate the 95% Confidence Interval from the bootstrap results
+ci_lower <- quantile(median_pcr_weib, 0.025)
+ci_upper <- quantile(median_pcr_weib, 0.975)
+
+median(median_pcr_weib)
+cat("95% Confidence Interval for the Median Time to Failure: [", ci_lower, ", ", ci_upper, "]\n")
+
+```
+
+```{r gamma}
+# Gamma bootstrap calculation
+median_pcr_gamma <- numeric(n_boot)  # Initialize for storing median times
+
+# # Perform bootstrapping for Gamma model
+for (i in 1:n_boot) {
+  # Resample data with replacement
+  bootstrap_sample <- pcr_data[sample(1:nrow(pcr_data), replace = TRUE), ]
+
+  # Fit the Gamma model on the bootstrap sample
+  fit_boot <- tryCatch({
+    ic_par(cbind(l, r) ~ NULL, data = bootstrap_sample, dist = 'gamma', model = 'aft')
+  }, error = function(e) NULL)
+
+  # Skip iteration if fit fails
+  if (is.null(fit_boot)) next
+
+  # Extract log_shape and log_scale from the bootstrapped fit
+  log_shape_boot <- coef(fit_boot)["log_shape"]
+  log_scale_boot <- coef(fit_boot)["log_scale"]
+
+  # Calculate shape and scale for the Gamma distribution
+  shape_boot <- exp(log_shape_boot)
+  scale_boot <- exp(log_scale_boot)
+
+  # Calculate median time to failure for this bootstrap sample (Gamma)
+  median_pcr_gamma[i] <- qgamma(0.5, shape = shape_boot, scale = scale_boot)
+}
+
+# Calculate the median and 95% Confidence Interval from the bootstrap results
+ci_lower_pcr_gamma <- quantile(median_pcr_gamma, 0.025)
+ci_upper_pcr_gamma <- quantile(median_pcr_gamma, 0.975)
+
+median(median_pcr_gamma)
+cat("95% Confidence Interval (Gamma): [", ci_lower_pcr_gamma, ", ", ci_upper_pcr_gamma, "]\n")
+
+```
+
+Create a dataset of people who were IgM ELISA positive at baseline then make their cohort plot:
+
+```{r igm}
+
+# Focus on participants that were positive at baseline
+igm_data <- cases_table1 %>% filter(baseline_igm_result==1)
+
+# Remove anyone that was indeterminate at fup. Those that were indeterminate at fup were negative at baseline, so this doesn't do anything
+igm_data <- igm_data %>% filter(fup_igm_result==0 | fup_igm_result==1 | is.na(fup_igm_result)==TRUE)
+
+# Make sure nobody has a date>365
+summary(igm_data$days_since_ajs_baseline)
+summary(igm_data$days_since_ajs_fup)
+
+# Transform to long dataset
+# Don't zoom in those who stayed positive for IgM, too many
+# Rename variables for easier pivoting
+igm_data <- igm_data %>% rename(baseline_days_since_ajs=days_since_ajs_baseline,
+                                fup_days_since_ajs=days_since_ajs_fup)
+
+igm_long <- igm_data %>% dplyr::select(baseline_days_since_ajs, fup_days_since_ajs, baseline_igm_result, fup_igm_result, pat_id, fup_bin)
+
+igm_long <- igm_long %>%
+  pivot_longer(
+    cols = c(baseline_days_since_ajs, baseline_igm_result, fup_days_since_ajs, fup_igm_result),
+    names_to = c("timepoint", ".value"),
+ names_pattern = "(baseline|fup)_(.*)")
+
+# Create a numeric version of IgM results since the current variable is char
+igm_long <- igm_long %>% mutate(igm_char= case_when(
+  igm_result==0 ~ "Negative",
+  igm_result==1 ~ "Positive",
+  TRUE ~ NA_character_))
+
+igm_long <- igm_long %>%
+  mutate(fup_result_type = case_when(
+    timepoint == "fup" & igm_char == "Positive" ~ "Positive",
+    timepoint == "fup" & igm_char == "Negative" ~ "Negative",
+    TRUE ~ NA_character_
+  ))
+
+# Order by follow-up test result then sort by days since ajs
+igm_long <- igm_long %>%
+  mutate(
+    fup_sort_order = ifelse(fup_result_type == "Negative", 1, 2)
+  ) %>%
+  arrange(fup_sort_order, desc(days_since_ajs))
+
+# need this step to ensure it plots correctly
+igm_long <- igm_long %>%
+  mutate(pat_id = factor(pat_id, levels = unique(pat_id)))
+
+# BEFORE PLOTTING NEED TO REMOVE PEOPLE WHO DON'T HAVE A FUP VISIT #
+igm_long <- igm_long %>% filter(fup_bin==1)
+
+# Cohort plot
+cohort_plot_igm <- ggplot(igm_long, aes(x = days_since_ajs, y = pat_id, group = pat_id)) +
+  geom_line(color="indianred3") +
+  geom_point(
+    data = igm_long,
+    aes(color = igm_char),
+    shape = 16, size = 2
+  ) +
+  # Customize the colors manually
+  scale_color_manual(values = c("Positive" = "indianred3", "Negative" = "black"),
+   limits = c("Positive", "Negative")) +
+  # Set x-axis ticks to show every 20 days
+  scale_x_continuous(breaks = seq(0, max(igm_long$days_since_ajs, na.rm = TRUE), by = 20)) +
+  # Change axis labels and legend title
+  labs(x = "Days since jaundice onset", y = "Participant", color = "ELISA Result") +
+  # Modify the theme to show the x-axis line and adjust text angles
+  theme_minimal() +
+  theme(
+    #axis.text.y = element_text(size = 3),  # Adjust the size as needed
+    axis.text.x = element_text(angle = 25),  # Rotate x-axis labels
+    panel.grid = element_blank(),  # Remove all grid lines
+    panel.border = element_blank(),  # Remove plot border 
+    axis.text.y=element_blank(),  #remove y axis labels
+    axis.ticks.y=element_blank()  #remove y axis ticks
+  ) + ggtitle("C")
+
+
+```
+
+Accelerated failure time model for ELISA IgM:
+
+```{r aft igm}
+
+igm_data <- igm_data %>% mutate(l = as.numeric(baseline_days_since_ajs),
+                                r = as.numeric(fup_days_since_ajs))
+
+igm_data <- igm_data %>% mutate(
+  l= case_when(
+      fup_igm_result==1 ~ r,
+      TRUE ~ l),
+  r= case_when(
+      fup_igm_result==0 ~ r,
+      TRUE ~ Inf
+))
+
+# Data check
+igm_data <- igm_data %>% mutate(flag=ifelse(l>r,1,0))
+tabyl(igm_data$flag)
+
+# NON PARAMETRIC MODELS
+np_fit_igm <- ic_np(cbind(l, r) ~ 0, data = igm_data)
+summary(np_fit_igm)
+
+getSCurves(np_fit_igm, newdata=NULL)
+plot(np_fit_igm, xlab = 'Days since jaundice onset', ylab = 'Estimated Survival')
+
+# Should be 14 total vertical lines
+vertical_igm <- data.frame(
+  x = c(10, 11, 19, 20, 27, 28, 33, 34, 64, 70, 86, 88, 181, 237),
+  y_start = c(1.00000000, 1.00000000, 0.9772348, 0.9772348, 0.9696970, 0.9696970, 0.9285714, 0.9285714, 0.8952976, 0.8952976, 0.6378442, 0.6378442, 0.4375000, 0.4375000),
+  y_end = c(0.9772348, 0.9772348, 0.9696970, 0.9696970, 0.9285714, 0.9285714, 0.8952976, 0.8952976, 0.6378442, 0.6378442, 0.4375000, 0.4375000, 0, 0)
+)
+
+horizontal_igm <- data.frame(
+  x_start = c(0, 10, 19, 27, 33, 64, 86, 181),
+  x_end = c(11, 20, 28, 34, 70, 88, 237, 237),
+  y = c(1.00000000, 0.9772348, 0.9696970, 0.9285714, 0.8952976, 0.6378442, 0.4375000, 0)
+)
+
+# Add shading for the rectangles
+shading_area_igm <- data.frame(
+x_start = c(10, 19, 27, 33, 64, 86, 181),
+x_end = c(11, 20, 28, 34, 70, 88, 237),
+  y_start = c(1.00000000, 0.9772348, 0.9696970, 0.9285714, 0.8952976, 0.6378442, 0.4375000),
+  y_end = c(0.9772348, 0.9696970, 0.9285714,0.8952976, 0.6378442,0.4375000, 0 ))
+
+# Create the plot
+nonparam_plot_igm <- ggplot() +
+  geom_segment(data = vertical_igm, 
+               aes(x = x, y = y_start, yend = y_end), 
+               size = 1, color = "blue") +
+  geom_segment(data = horizontal_igm, 
+               aes(x = x_start, xend=x_end, y = y), 
+               size = 1, color = "blue") +
+  geom_rect(data = shading_area_igm, 
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end), 
+            fill = "blue", alpha = 0.5) + # Adjust fill color and transparency
+  labs(x = "Days Since Jaundice Onset",
+       y = "Probability of IgM Seropositivity") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  theme_minimal() + theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank()   # Remove minor gridlines
+  ) 
+
+# Unadjusted model
+fit_lnorm_igm <- ic_par(cbind(l, r) ~ NULL , data = igm_data, dist = 'lnorm',
+model = 'aft')
+summary(fit_lnorm_igm) # dispersion is exp(log_s)
+confint(fit_lnorm_igm)
+plot(fit_lnorm_igm)
+
+fit_weib_igm <- ic_par(cbind(l, r) ~ NULL ,data = igm_data, dist = 'weibull',
+model = 'aft')
+summary(fit_weib_igm)
+plot(fit_weib_igm)
+
+fit_gamma_igm <- ic_par(cbind(l, r) ~ NULL ,data = igm_data, dist = 'gamma',
+model = 'aft')
+summary(fit_gamma_igm)
+
+# Compare AIC for each model
+n_params_lnorm_igm <- length(coef(fit_lnorm_igm))  # Number of coefficients in the model
+n_params_weib_igm <- length(coef(fit_weib_igm))
+n_params_gamma_igm <- length(coef(fit_gamma_igm))
+
+# Calculate AIC manually
+aic_lnorm_igm <- 2 * n_params_lnorm_igm - (2 * (-42.10767 ))
+aic_weib_igm <- 2 * n_params_weib_igm - (2 * (-41.71249 ))
+aic_gamma_igm <- 2 * n_params_gamma_igm - (2 * (-41.65237))
+
+# Compare AIC values
+aic_values_igm <- c(lnorm = aic_lnorm_igm, gamma = aic_gamma_igm, weib = aic_weib_igm)
+best_model_igm <- names(aic_values_igm)[which.min(aic_values_igm)]
+cat("Best model based on AIC: ", best_model_igm, "\n")
+
+# BEST FITTING MODEL FORM IgM: gamma
+igm_data <- igm_data %>% mutate(id_sex_numeric=case_when(
+  id_sex=="Male" ~ 0,
+  id_sex=="Female" ~ 1,
+  TRUE ~ NA_real_
+))
+
+fit_adjusted_igm_sex_gamma <- ic_par(cbind(l, r) ~ id_sex_numeric,
+data = igm_data, dist = 'gamma',
+model = 'aft')
+
+summary(fit_adjusted_igm_sex_gamma)
+# 
+# # # Categorical
+fit_adjusted_igm_age <- ic_par(cbind(l, r) ~ age_group_simple,
+data = igm_data, dist = 'gamma',
+model = 'aft')
+summary(fit_adjusted_igm_age)
+
+# # Continuous
+fit_adjusted_igm_age <- ic_par(cbind(l, r) ~ age,
+data = igm_data, dist = 'gamma',
+model = 'aft')
+
+# # Try under 5 and over five
+igm_data <- igm_data %>% mutate(age5 = ifelse(age<=5,1,0))
+fit_adjusted_igm_agebin5 <- ic_par(cbind(l, r) ~ age5,
+data = igm_data, dist = 'gamma',
+model = 'aft')
+summary(fit_adjusted_igm_agebin5)
+
+igm_data <- igm_data %>% mutate(age10 = ifelse(age<=10,1,0))
+fit_adjusted_igm_agebin10 <- ic_par(cbind(l, r) ~ age10,
+data = igm_data, dist = 'gamma',
+model = 'aft')
+summary(fit_adjusted_igm_agebin10)
+
+time_points_igm <- seq(0, 300, length.out = 100)
+
+# Bootstrapping for overall curve
+# Initialize matrix to store survival probabilities from each bootstrap iteration
+# Calculate survival probabilities and CI bounds for each time point
+
+set.seed(123)
+
+survival_boot_igm <- matrix(NA, nrow = n_boot, ncol = length(time_points_igm))
+median_igm_gamma <- numeric(n_boot)  # Initialize for storing median times
+
+set.seed(123)
+
+# Perform bootstrapping for Gamma model
+for (i in 1:n_boot) {
+  # Resample data with replacement
+  bootstrap_sample <- igm_data[sample(1:nrow(igm_data), replace = TRUE), ]
+  
+  # Fit the Gamma model on the bootstrap sample
+  fit_boot <- tryCatch({
+    ic_par(cbind(l, r) ~ NULL, data = bootstrap_sample, dist = 'gamma', model = 'aft')
+  }, error = function(e) NULL)
+  
+  # Skip iteration if fit fails
+  if (is.null(fit_boot)) next
+  
+  log_shape <- coef(fit_boot)["log_shape"]
+  log_scale <- coef(fit_boot)["log_scale"]
+  shape_boot <- exp(log_shape)
+  scale_boot <- exp(log_scale)
+  
+  # Calculate median time to failure for this bootstrap sample (Gamma)
+  median_igm_gamma[i] <- qgamma(0.5, shape = shape_boot, scale = scale_boot)
+  survival_boot_igm[i, ] <- 1 - pgamma(time_points_igm, shape = shape_boot, scale = scale_boot)
+  
+}
+
+# Calculate the median and 95% Confidence Interval from the bootstrap results
+ci_lower_igm <- quantile(median_igm_gamma, 0.025)
+ci_upper_igm <- quantile(median_igm_gamma, 0.975)
+
+median(median_igm_gamma)
+cat("95% Confidence Interval for the Median Time to Failure: [", ci_lower_igm, ", ", ci_upper_igm, "]\n")
+
+# Remove rows with NA values from failed fits
+survival_boot_igm <- survival_boot_igm[complete.cases(survival_boot_igm), ]
+
+# Now calculate the median and CI for the survival curve
+survival_median_igm <- apply(survival_boot_igm, 2, median)
+survival_lower_igm <- apply(survival_boot_igm, 2, function(x) quantile(x, 0.025))
+survival_upper_igm <- apply(survival_boot_igm, 2, function(x) quantile(x, 0.975))
+
+# Combine results into a data frame for plotting
+survival_df_igm <- data.frame(
+  time = time_points_igm,
+  survival_median = survival_median_igm,
+  survival_lower = survival_lower_igm,
+  survival_upper = survival_upper_igm
+)
+
+# Convert to long dataset so I can plot all 100 curves
+# Convert survival_boot_pcr to a data frame, setting column names as time points
+survival_boot_df <- as.data.frame(survival_boot_igm)
+colnames(survival_boot_df) <- time_points_igm  # Set the column names to time points
+survival_boot_df$bootstrap <- 1:nrow(survival_boot_df)  # Add a column for bootstrap index
+
+# Pivot to long format
+survival_boot_long <- survival_boot_df %>%
+  pivot_longer(
+    cols = -bootstrap, 
+    names_to = "time", 
+    values_to = "survival"
+  ) %>%
+  mutate(time = as.numeric(time))  # Convert time from character to numeric
+
+# Plot the survival curve with confidence intervals
+plot_gamma_igm <- ggplot() +
+ geom_line(data = survival_boot_long, aes(x = time, y = survival, group = bootstrap), 
+            color = "grey", alpha = 0.5) +
+  geom_line(data = survival_df_igm, aes(x = time, y = survival_median), color = "blue", size = 1) +
+
+  # # Add vertical segments
+  geom_segment(data = vertical_igm,
+               aes(x = x, y = y_start, xend = x, yend = y_end),
+               size = 1, color = "palegreen3") +
+
+  # Add horizontal segments
+  geom_segment(data = horizontal_igm,
+               aes(x = x_start, xend = x_end, y = y, yend = y),
+               size = 1, color = "palegreen3") +
+
+  # Add shading area
+  geom_rect(data = shading_area_igm,
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end),
+            fill = "palegreen3", alpha = 0.5) +
+  
+  # Add labels and theme
+  labs(x = "Days since jaundice onset", y = "Probability of having a IgM ELISA positive result") +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank()   # Remove minor gridlines
+  ) + ggtitle("D") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1))
+
+plot_gamma_igm
+
+```
+
+IgM AFT by age group:
+
+```{r igm_aft_age}
+# Initialize matrices or lists to store results separately for each age group
+survival_boot_under5 <- matrix(NA, nrow = n_boot, ncol = length(time_points_igm))
+survival_boot_over5 <- matrix(NA, nrow = n_boot, ncol = length(time_points_igm))
+median_times_under5 <- numeric(n_boot)
+median_times_over5 <- numeric(n_boot)
+
+set.seed(123)
+
+# Perform bootstrapping
+for (i in 1:n_boot) {
+  
+  # Resample data with replacement
+  bootstrap_sample <- igm_data[sample(1:nrow(igm_data), replace = TRUE), ]
+  
+  # Fit the Gamma model on the bootstrap sample with age5 as a predictor
+  fit_boot <- tryCatch({
+    ic_par(cbind(l, r) ~ age5, data = bootstrap_sample, dist = 'gamma', model = 'aft')
+  }, error = function(e) NULL)
+  
+  # Skip iteration if fit fails
+  if (is.null(fit_boot)) next
+  
+  log_shape <- coef(fit_boot)["log_shape"]
+  log_scale <- coef(fit_boot)["log_scale"]
+  
+  # Exponentiate
+  shape_boot <- exp(log_shape)
+
+  # Extract the coefficient for the age5 variable (effect of age group)
+  age_effect <- coef(fit_boot)["age5"]  # Effect of age on scale (log scale)
+  
+  # Separate bootstrap samples by age group
+  bootstrap_under5 <- bootstrap_sample[bootstrap_sample$age5 == 1, ]
+  bootstrap_over5 <- bootstrap_sample[bootstrap_sample$age5 == 0, ]
+  
+  # For Under 5 (age5 == 1), adjust the scale based on the age effect
+  adjusted_scale_under5 <- exp(log_scale + age_effect)  
+  adjusted_scale_over5 <- exp(log_scale)  
+
+  # Survival calculations (1 - survival function) for each group
+  survival_boot_under5[i, ] <- 1 - pgamma(time_points_igm, shape = shape_boot, scale = adjusted_scale_under5)
+  survival_boot_over5[i, ] <- 1 - pgamma(time_points_igm, shape = shape_boot, scale = adjusted_scale_over5)
+  
+  # Calculate median time to failure for each bootstrap sample (Gamma) for each group
+  median_times_under5[i] <- qgamma(0.5, shape = shape_boot, scale = adjusted_scale_under5)
+  median_times_over5[i] <- qgamma(0.5, shape = shape_boot, scale = adjusted_scale_over5)
+}
+
+
+# Calculate the median and 95% Confidence Interval from the bootstrap results
+ci_lower_igm_under5 <- quantile(median_times_under5, 0.025)
+ci_upper_igm_under5 <- quantile(median_times_under5, 0.975)
+
+median(median_times_under5)
+cat("95% Confidence Interval for the Median Time to Failure: [", ci_lower_igm_under5, ", ", ci_upper_igm_under5, "]\n")
+
+ci_lower_igm_over5 <- quantile(median_times_over5, 0.025)
+ci_upper_igm_over5 <- quantile(median_times_over5, 0.975)
+
+median(median_times_over5)
+cat("95% Confidence Interval for the Median Time to Failure: [", ci_lower_igm_over5, ", ", ci_upper_igm_over5, "]\n")
+
+# Remove rows with NA values from failed fits for both groups
+survival_boot_under5 <- survival_boot_under5[complete.cases(survival_boot_under5), ]
+survival_boot_over5 <- survival_boot_over5[complete.cases(survival_boot_over5), ]
+
+# Overall median and CI at each time point for both age groups
+survival_median_under5 <- apply(survival_boot_under5, 2, median)
+survival_lower_under5 <- apply(survival_boot_under5, 2, function(x) quantile(x, 0.025))
+survival_upper_under5 <- apply(survival_boot_under5, 2, function(x) quantile(x, 0.975))
+
+survival_median_over5 <- apply(survival_boot_over5, 2, median)
+survival_lower_over5 <- apply(survival_boot_over5, 2, function(x) quantile(x, 0.025))
+survival_upper_over5 <- apply(survival_boot_over5, 2, function(x) quantile(x, 0.975))
+
+# Combine results into separate data frames for plotting each group. Add a group variable
+survival_df_under5 <- data.frame(
+  time = time_points_igm,
+  survival_median = survival_median_under5,
+  survival_lower = survival_lower_under5,
+  survival_upper = survival_upper_under5,
+  group = "Under 5"
+)
+
+survival_df_over5 <- data.frame(
+  time = time_points_igm,
+  survival_median = survival_median_over5,
+  survival_lower = survival_lower_over5,
+  survival_upper = survival_upper_over5,
+  group = "Over 5"
+)
+
+# Convert to long dataset for plotting both curves
+survival_boot_df_under5 <- as.data.frame(survival_boot_under5)
+colnames(survival_boot_df_under5) <- time_points_igm  # Set the column names to time points
+survival_boot_df_under5$bootstrap <- 1:nrow(survival_boot_df_under5)  # Add a column for bootstrap index
+
+survival_boot_df_over5 <- as.data.frame(survival_boot_over5)
+colnames(survival_boot_df_over5) <- time_points_igm  # Set the column names to time points
+survival_boot_df_over5$bootstrap <- 1:nrow(survival_boot_df_over5)  # Add a column for bootstrap index
+
+# Pivot to long format for each group
+survival_boot_long_under5 <- survival_boot_df_under5 %>%
+  pivot_longer(
+    cols = -bootstrap, 
+    names_to = "time", 
+    values_to = "survival"
+  ) %>%
+  mutate(time = as.numeric(time))  # Convert time from character to numeric
+
+survival_boot_long_over5 <- survival_boot_df_over5 %>%
+  pivot_longer(
+    cols = -bootstrap, 
+    names_to = "time", 
+    values_to = "survival"
+  ) %>%
+  mutate(time = as.numeric(time))  # Convert time from character to numeric
+
+# Get turnbull intervals for each age group
+
+newdata <- data.frame(age5 = c(0, 1) )
+rownames(newdata) <- c('Over 5', 'Under 5')
+
+np_fit_age_igm <- ic_np(cbind(l, r) ~ age5, data = igm_data)
+
+summary(np_fit_age_igm)
+
+plot(np_fit_age_igm, col = c('#FDC067FF', '#751C6DFF'), xlab = 'Time', ylab = 'Estimated Survival')
+
+# # Extract Turnbull intervals for each age group
+turnbull_intervals <- lapply(np_fit_age_igm$fitList, function(fit) {
+  fit$T_bull_Intervals
+})
+
+# # Name the list for clarity
+names(turnbull_intervals) <- c("Over 5", "Under 5")
+
+# Display the Turnbull intervals
+turnbull_intervals
+
+# # Extract survival estimates for each age group
+survival_estimates_age <- lapply(np_fit_age_igm$scurves, function(curve) {
+  curve$S_curves$baseline
+})
+
+# Name the list for clarity
+names(survival_estimates_age) <- c("Over 5", "Under 5")
+
+# Data for Turnbull intervals
+vertical_igm_over5 <- data.frame(
+  x = c(10, 11, 19, 20, 27, 28, 37, 38, 111, 114, 165, 304),
+  y_start = c(1.00000000, 1.00000000,0.9733855, 0.9733855, 0.9642857, 0.9642857, 0.9333333, 0.9333333, 0.8813266, 0.8813266, 0.5000000, 0.5000000),
+  y_end = c(0.9733855, 0.9733855, 0.9642857, 0.9642857, 0.9333333, 0.9333333, 0.8813266, 0.8813266, 0.5000000, 0.5000000, 0, 0))
+
+vertical_igm_under5 <- data.frame(
+  x = c(33, 34, 59, 70, 138, 237),
+  y_start = c(1.00000000, 1.00000000, 0.8059899, 0.8059899, 0.1077834, 0.1077834),
+  y_end = c(0.8059899, 0.8059899, 0.1077834, 0.1077834, 0, 0)
+)
+
+# # Now add the horizontal lines
+horizontal_igm_over5 <- data.frame(
+  x_start = c(0, 10, 19, 27, 37, 111, 181),
+  x_end = c(11, 20, 28, 38, 114, 304, 304),
+  y = c(1.00000000, 0.9733855, 0.9642857, 0.9333333, 0.8813266, 0.5000000, 0)
+)
+
+horizontal_igm_under5 <- data.frame(
+  x_start = c(0, 33, 59, 138),
+  x_end = c(34, 70, 237, 304),
+  y = c(1.00000000, 0.8059899, 0.1077834, 0)
+)
+
+# # Add shading for the rectangles
+shading_area_igm_over5 <- data.frame(
+x_start = c(10, 19, 27, 37,111, 165),
+x_end = c(11, 20, 28, 38, 114, 304 ),
+  y_start = c(1.00000000, 0.9733855, 0.9642857, 0.9333333, 0.8813266, 0.5000000),
+  y_end = c(0.9733855, 0.9642857, 0.9333333,  0.8813266, 0.5000000, 0))
+
+shading_area_igm_under5 <- data.frame(
+x_start = c(33, 59, 138),
+x_end = c(34, 70, 237),
+  y_start = c(1.00000000, 0.8059899, 0.1077834),
+  y_end = c(0.8059899, 0.1077834, 0))
+
+nonparam_plot_igm_age <- ggplot() +
+  geom_segment(data = vertical_igm_over5,
+               aes(x = x, y = y_start, yend = y_end),
+               size = 1, color = "#FDC067FF") +
+  geom_segment(data = horizontal_igm_over5,
+               aes(x = x_start, xend=x_end, y = y),
+               size = 1, color = "#FDC067FF") +
+  geom_rect(data = shading_area_igm_over5,
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end),
+            fill = "#FDC067FF", alpha = 0.5) + # Adjust fill color and transparency
+  geom_segment(data = vertical_igm_under5,
+               aes(x = x, y = y_start, yend = y_end),
+               size = 1, color = "#751C6DFF") +
+  geom_segment(data = horizontal_igm_under5,
+               aes(x = x_start, xend=x_end, y = y),
+               size = 1, color = "#751C6DFF") +
+  geom_rect(data = shading_area_igm_under5,
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end),
+            fill = "#751C6DFF", alpha = 0.5) +
+  labs(x = "Days Since Jaundice Onset",
+       y = "Survival Probability") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  theme_minimal() 
+
+# Plot the survival curve with confidence intervals for both age groups
+plot_gamma_igm_age <- ggplot() +
+  # For Under 5 group (bootstraps without affecting legend)
+  geom_line(data = survival_boot_long_under5, aes(x = time, y = survival, group = bootstrap), 
+            color = "#751C6DFF", alpha = 0.05) +
+  geom_line(data = survival_df_under5, aes(x = time, y = survival_median, color = group), size = 1, linetype = "dashed") +
+  # For Over 5 group (bootstraps without affecting legend)
+  geom_line(data = survival_boot_long_over5, aes(x = time, y = survival, group = bootstrap), 
+            color = "#FDC067FF", alpha = 0.05) +
+  geom_line(data = survival_df_over5, aes(x = time, y = survival_median, color = group), size = 1, linetype = "dashed") +
+  # Add labels and theme
+  labs(x = "Days since jaundice onset", y = "Probability of having a IgM ELISA positive result", color = "Age Group") +
+  theme_minimal() + 
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  # Manually specify legend colors
+  scale_color_manual(values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"), breaks=c("Under 5", "Over 5")) +
+  # Add turnbull intervals
+  geom_segment(data = vertical_igm_over5,
+               aes(x = x, y = y_start, yend = y_end),
+               size = 1, color = "#FDC067FF") +
+  geom_segment(data = horizontal_igm_over5,
+               aes(x = x_start, xend=x_end, y = y),
+               size = 1, color = "#FDC067FF") +
+  geom_rect(data = shading_area_igm_over5,
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end),
+            fill = "#FDC067FF", alpha = 0.5) + # Adjust fill color and transparency
+  geom_segment(data = vertical_igm_under5,
+               aes(x = x, y = y_start, yend = y_end),
+               size = 1, color = "#751C6DFF") +
+  geom_segment(data = horizontal_igm_under5,
+               aes(x = x_start, xend=x_end, y = y),
+               size = 1, color = "#751C6DFF") +
+  geom_rect(data = shading_area_igm_under5,
+            aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end),
+            fill = "#751C6DFF", alpha = 0.5) 
+
+plot_gamma_igm_age
+
+```
+
+Sensitivity analyses for supplement
+
+```{r weib}
+median_igm_weib <- numeric(n_boot)  # Initialize with NA values
+
+# # Perform bootstrapping
+for (i in 1:n_boot) {
+
+  # Resample data with replacement
+  bootstrap_sample <- igm_data[sample(1:nrow(igm_data), replace = TRUE), ]
+
+  # Fit the Weibull model on the bootstrap sample
+  fit_boot <- tryCatch({
+    ic_par(cbind(l, r) ~ NULL, data = bootstrap_sample, dist = 'weibull', model = 'aft')
+  }, error = function(e) NULL)
+
+  # Skip iteration if fit fails
+  if (is.null(fit_boot)) next
+
+  # Extract log_scale and log_shape from the bootstrapped fit
+  log_scale_boot <- coef(fit_boot)["log_scale"]
+  log_shape_boot <- coef(fit_boot)["log_shape"]
+
+    # Compute scale and shape
+  scale_boot <- exp(log_scale_boot)
+  shape_boot <- exp(log_shape_boot)
+
+  # Calculate median time to failure for this bootstrap sample
+  median_igm_weib[i] <- scale_boot * (log(2))^(1 / shape_boot)
+
+}
+
+# Median time to failure and confidence interval
+# Calculate the 95% Confidence Interval from the bootstrap results
+ci_lower_igm_weib <- quantile(median_igm_weib, 0.025)
+ci_upper_igm_weib <- quantile(median_igm_weib, 0.975)
+
+median(median_igm_weib)
+cat("95% Confidence Interval for the Median Time to Failure: [", ci_lower_igm_weib, ", ", ci_upper_igm_weib, "]\n")
+
+```
+ 
+```{r lnorm}
+median_igm_lnorm <- numeric(n_boot)  # Initialize with NA values
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Log-normal bootstrap calculation
+
+# Perform bootstrapping for log-normal model
+for (i in 1:n_boot) {
+  # Resample data with replacement
+  bootstrap_sample <- igm_data[sample(1:nrow(igm_data), replace = TRUE), ]
+  
+  # Fit the log-normal model on the bootstrap sample
+  fit_boot <- tryCatch({
+    ic_par(cbind(l, r) ~ NULL, data = bootstrap_sample, dist = 'lnorm', model = 'aft')
+  }, error = function(e) NULL)
+  
+  # Skip iteration if fit fails
+  if (is.null(fit_boot)) next
+  
+  # Extract log_scale and log_shape from the bootstrapped fit
+  log_mu_boot <- coef(fit_boot)["mu"]
+  log_sigma_boot <- exp(coef(fit_boot)["log_s"])
+
+  # Calculate median time to failure for this bootstrap sample (log-normal)
+  median_igm_lnorm[i] <- exp(log_mu_boot)  # Median for log-normal is exp(mu)
+}
+
+ci_lower_igm_lnorm <- quantile(median_igm_lnorm, 0.025)
+ci_upper_igm_lnorm <- quantile(median_igm_lnorm, 0.975)
+
+median(median_igm_lnorm)
+cat("95% Confidence Interval for the Median Time to Failure: [", ci_lower_igm_lnorm, ", ", ci_upper_igm_lnorm, "]\n")
+
+
+```
+
+Retrodictive check on AFT model: PCR
+
+```{r aft pcr}
+
+# Create binned version
+pcr_data <- pcr_data %>% mutate(ajs_bin = case_when(
+  fup_days_since_ajs<=7 ~ "Early",
+  fup_days_since_ajs>7 & fup_days_since_ajs<=21 ~ "Medium",
+  fup_days_since_ajs>21  ~ "Long",
+TRUE ~ NA_character_))
+
+# Fit the model once on the entire dataset
+fit_pcr_overall <- ic_par(cbind(l, r) ~ NULL, data = pcr_data, dist = 'lnorm', model = 'aft')
+  
+# Extract coefficients from the fitted model
+log_mu <- coef(fit_pcr_overall)["mu"]
+log_sigma <- coef(fit_pcr_overall)["log_s"]
+
+# Perform bootstrapping for each individual
+set.seed(123)  # Ensure reproducibility
+
+# Calculate survival probabilities for every individual in the dataset
+pcr_data <- pcr_data %>%
+  mutate(
+    survival_prob = plnorm(
+      fup_days_since_ajs,
+      meanlog = log_mu,
+      sdlog = exp(log_sigma),
+      lower.tail = FALSE
+    )
+  )
+  
+
+# Initialize a list to store bootstrap results
+boot_results_pcr <- lapply(1:n_boot, function(i) {
+  # Resample the dataset with replacement
+  boot_sample <- pcr_data %>% sample_n(size = n(), replace = TRUE)
+  
+  # Generate new predicted results for the resampled dataset
+  boot_sample <- boot_sample %>%
+    mutate(predicted_result = rbinom(n(), 1, survival_prob))
+  
+  # Calculate the mean predicted result for this bootstrap sample
+  boot_sample %>% group_by(ajs_bin) %>%
+    mutate(mean_predicted_result = mean(predicted_result))
+})
+
+# Combine all bootstrap results into a single data frame
+boot_results_pcr <- bind_rows(boot_results_pcr)
+
+# boot_early_pcr <- boot_results_pcr %>% filter(ajs_bin=="Early")
+boot_med_pcr <- boot_results_pcr %>% filter(ajs_bin=="Medium")
+boot_long_pcr <- boot_results_pcr %>% filter(ajs_bin=="Long")
+
+# Summarize results: average and confidence intervals for the predicted results
+boot_med_summary_pcr <- boot_med_pcr %>%
+  summarise(
+    average_predicted_result = mean(mean_predicted_result),
+    lower_ci_predicted_result = quantile(mean_predicted_result, 0.025),
+    upper_ci_predicted_result = quantile(mean_predicted_result, 0.975)
+  )
+
+boot_long_summary_pcr <- boot_long_pcr %>%
+  summarise(
+    average_predicted_result = mean(mean_predicted_result),
+    lower_ci_predicted_result = quantile(mean_predicted_result, 0.025),
+    upper_ci_predicted_result = quantile(mean_predicted_result, 0.975)
+  )
+
+pcr_data <- pcr_data %>% mutate(fup_pcr_result = case_when(
+  fup_pcr_result==1 ~ "Positive",
+  fup_pcr_result==0 ~ "Negative",
+  TRUE ~ NA_character_
+))
+
+# Now compare their predicted and real fup test result
+early_truth_pcr <- pcr_data %>% filter(ajs_bin=="Early") %>% tabyl(fup_pcr_result)
+med_truth_pcr <- pcr_data %>% filter(ajs_bin=="Medium") %>% tabyl(fup_pcr_result)
+long_truth_pcr <- pcr_data %>% filter(ajs_bin=="Long") %>% tabyl(fup_pcr_result)
+
+props_early_truth_pcr <- early_truth_pcr$percent
+props_med_truth_pcr <- med_truth_pcr$percent
+props_long_truth_pcr <- long_truth_pcr$percent
+
+compare_result_med_pcr <- data.frame(
+  result = c("Positive"),
+  proportion = c(props_med_truth_pcr[2], boot_med_summary_pcr$average_predicted_result),
+  type = c("truth", "retro"),
+  lower = c(NA, boot_med_summary_pcr$lower_ci_predicted_result),
+  upper = c(NA, boot_med_summary_pcr$upper_ci_predicted_result))
+
+compare_result_long_pcr <- data.frame(
+  result = c("Positive"),
+  proportion = c(props_long_truth_pcr[2], boot_long_summary_pcr$average_predicted_result),
+  type = c("truth", "retro"),
+  lower = c(NA, boot_long_summary_pcr$lower_ci_predicted_result),
+  upper = c(NA, boot_long_summary_pcr$upper_ci_predicted_result))
+
+# # Create a plot
+compare_result_plot_med_pcr <- ggplot(compare_result_med_pcr, aes(x = as.factor(result), y = proportion, color = factor(type))) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),  
+    width = 0, position=position_dodge(width=0.5)
+  ) +
+  geom_point(size = 3, position=position_dodge(width=0.5)) +  theme_minimal() + theme(axis.text.x = element_text(angle = 45, size=5), plot.title = element_text(size = 8), legend.title = element_blank()) + labs(x="PCR at follow-up", y="Proportion of sample") + ylim(0,1) + scale_color_discrete(labels=c('Retrodiction', 'Observed Data')) + ggtitle("PCR: 7-21 days between jaundice onset and careseeking") + ylim(0,1)
+
+compare_result_plot_med_pcr 
+
+compare_result_plot_long_pcr <- ggplot(compare_result_long_pcr, aes(x = as.factor(result), y = proportion, color = factor(type))) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),  
+    width = 0, position=position_dodge(width=0.5)
+  ) +
+  geom_point(size = 3, position=position_dodge(width=0.5)) +  theme_minimal() + theme(axis.text.x = element_text(angle = 45, size=5), plot.title = element_text(size = 8), legend.title = element_blank()) + labs(x="PCR at follow-up", y="Proportion of sample") + ylim(0,1) + scale_color_discrete(labels=c('Retrodiction', 'Observed Data')) + ggtitle( "PCR: ≥ 22 days between jaundice onset and careseeking") + ylim(0,1)
+
+compare_result_plot_long_pcr
+
+# Combine all plots into one with 4 panels: PCR med, PCR long, ELISA short, ELISA long
+```
+
+Retrodictive check on AFT model: IgM
+
+```{r aft igm}
+
+# Create binned version
+igm_data <- igm_data %>% mutate(ajs_bin = case_when(
+  fup_days_since_ajs<=7 ~ "Early",
+  fup_days_since_ajs>7 & fup_days_since_ajs<=21 ~ "Medium",
+  fup_days_since_ajs>21  ~ "Long",
+TRUE ~ NA_character_))
+
+# Fit the model once on the entire dataset
+fit_igm_overall <- ic_par(cbind(l, r) ~ NULL, data = igm_data, dist = 'gamma', model = 'aft')
+
+# Extract coefficients from the fitted model
+log_shape_boot <- coef(fit_igm_overall)["log_shape"]
+log_scale_boot <- coef(fit_igm_overall)["log_scale"]
+  
+  # Calculate shape and scale for the Gamma distribution
+  shape_boot <- exp(log_shape_boot)
+  scale_boot <- exp(log_scale_boot)
+
+# Perform bootstrapping for each individual
+set.seed(123)  # Ensure reproducibility
+
+# Calculate survival probabilities for every individual in the dataset
+igm_data <- igm_data %>%
+  mutate(
+    survival_prob = pgamma(
+      fup_days_since_ajs,
+      shape = shape_boot,
+      scale= scale_boot,
+      lower.tail = FALSE
+    )
+  )
+
+# Number of bootstrap samples
+n_boot <- 500
+
+# Initialize a list to store bootstrap results
+boot_results_igm <- lapply(1:n_boot, function(i) {
+  # Resample the dataset with replacement
+  boot_sample <- igm_data %>% sample_n(size = n(), replace = TRUE)
+  
+  # Generate new predicted results for the resampled dataset
+  boot_sample <- boot_sample %>%
+    mutate(predicted_result = rbinom(n(), 1, survival_prob))
+  
+  # Calculate the mean predicted result for this bootstrap sample
+  boot_sample %>% group_by(ajs_bin) %>%
+    mutate(mean_predicted_result = mean(predicted_result))
+})
+
+# Combine all bootstrap results into a single data frame
+boot_results_igm <- bind_rows(boot_results_igm)
+
+# boot_early_igm <- boot_results_igm %>% filter(ajs_bin=="Early")
+boot_med_igm <- boot_results_igm %>% filter(ajs_bin=="Medium")
+boot_long_igm <- boot_results_igm %>% filter(ajs_bin=="Long")
+
+# Summarize results: average and confidence intervals for the predicted results
+boot_results_med_igm <- boot_med_igm %>%
+  summarise(
+    average_predicted_result = mean(mean_predicted_result),
+    lower_ci_predicted_result = quantile(mean_predicted_result, 0.025),
+    upper_ci_predicted_result = quantile(mean_predicted_result, 0.975)
+  )
+
+boot_results_long_igm <- boot_long_igm %>%
+  summarise(
+    average_predicted_result = mean(mean_predicted_result),
+    lower_ci_predicted_result = quantile(mean_predicted_result, 0.025),
+    upper_ci_predicted_result = quantile(mean_predicted_result, 0.975)
+  )
+
+# Now compare their predicted and real fup test result
+med_truth_igm <- igm_data %>% filter(ajs_bin=="Medium") %>% tabyl(fup_igm_result)
+long_truth_igm <- igm_data %>% filter(ajs_bin=="Long") %>% tabyl(fup_igm_result)
+
+props_med_truth_igm <- med_truth_igm$percent
+props_long_truth_igm <- long_truth_igm$percent
+
+compare_result_med_igm <- data.frame(
+  result = c("Positive"),
+  proportion = c(props_med_truth_igm[2], boot_results_med_igm$average_predicted_result),
+  type = c("truth", "retro"),
+  lower = c(NA, boot_results_med_igm$lower_ci_predicted_result),
+  upper = c(NA, boot_results_med_igm$upper_ci_predicted_result))
+
+compare_result_long_igm <- data.frame(
+  result = c("Positive"),
+  proportion = c(props_long_truth_igm[2], boot_results_long_igm$average_predicted_result),
+  type = c("truth", "retro"),
+  lower = c(NA, boot_results_long_igm$lower_ci_predicted_result),
+  upper = c(NA, boot_results_long_igm$upper_ci_predicted_result))
+
+# # Create a plot
+compare_result_plot_med_igm <- ggplot(compare_result_med_igm, aes(x = as.factor(result), y = proportion, color = factor(type))) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),  
+    width = 0, position=position_dodge(width=0.5)
+  ) +
+  geom_point(size = 3, position=position_dodge(width=0.5)) +  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, size=5), plot.title = element_text(size = 8), legend.title = element_blank()) + labs(x="ELISA at follow-up", y="Proportion of sample") + scale_color_discrete(labels=c('Retrodiction', 'Observed Data')) + ggtitle("ELISA: 7-21 days between jaundice onset and careseeking") + ylim(0,1)
+
+compare_result_plot_med_igm
+
+compare_result_plot_long_igm <- ggplot(compare_result_long_igm, aes(x = as.factor(result), y = proportion, color = factor(type))) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),  
+    width = 0, position=position_dodge(width=0.5)
+  ) +
+  geom_point(size = 3, position=position_dodge(width=0.5)) +  theme_minimal() + theme(axis.text.x = element_text(angle = 45, size=5), plot.title = element_text(size = 8), legend.title = element_blank()) + labs(x="ELISA at follow-up", y="Proportion of sample") + scale_color_discrete(labels=c('Retrodiction', 'Observed Data')) + ggtitle("ELISA: ≥ 22 days between jaundice onset and careseeking") + ylim(0,1)
+
+compare_result_plot_long_igm
+
+# Put together all the AFT plots
+# Extract the common legend from one of the plots (e.g., compare_result_early_plot)
+legend_aft <- get_legend(compare_result_plot_med_pcr)
+
+# Remove legends from all plots
+compare_result_plot_med_pcr <- compare_result_plot_med_pcr + theme(legend.position = "none")
+compare_result_plot_long_pcr <- compare_result_plot_long_pcr + theme(legend.position = "none")
+compare_result_plot_med_igm <- compare_result_plot_med_igm + theme(legend.position = "none")
+compare_result_plot_long_igm <- compare_result_plot_long_igm + theme(legend.position = "none")
+
+# Combine the three plots into one grid
+compare_result_full_aft <- plot_grid(
+compare_result_plot_med_pcr, compare_result_plot_med_igm, compare_result_plot_long_pcr, compare_result_plot_long_igm,
+  ncol = 2, 
+  rel_heights = c(1, 1, 1, 1)  
+)
+
+# Add the common legend to the combined plot
+final_plot_aft <- plot_grid(compare_result_full_aft, legend_aft, ncol = 2, rel_widths = c(0.85, 0.15))  # Adjust width for the legend
+
+# Display the final plot with the common legend
+final_plot_aft
+
+```

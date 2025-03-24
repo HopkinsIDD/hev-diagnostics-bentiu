@@ -1,0 +1,4601 @@
+---
+title: "Public code for latent models"
+author: "Aybuke Koyuncu"
+date: "2025-03-21"
+output: html_document
+---
+
+First load in cleaned data. Everyone in this dataset has test results.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Loading packages and data 
+library(here)
+library(gtsummary)
+library(knitr)
+library(cowplot)
+library(ggridges)
+library(stringr)
+library(splines)
+library(splines2)
+library(bayesplot)
+library(cmdstanr)
+library(rstan)
+library(shinystan)
+library(icenReg)
+library(dplyr)
+library(epiR)
+library(knitr)
+library(cowplot)
+library(readr)
+library(lubridate)
+library(loo)
+library(tidyr)
+library(janitor)
+library(reshape2)
+library(ggplot2)
+library(readr)
+
+# # Create functions to transform data so sens/spec stay within 0 to 1 bounds
+logit_transform <- function(p) {
+  log(p / (1 - p))
+}
+
+inverse_logit_transform <- function(x) {
+  exp(x) / (1 + exp(x))
+}
+
+credible_level <- 0.95
+
+cases_table1  <- read_csv(here("scripts/Diagnostics/For Git/dat_minimal.csv"))
+
+```
+
+
+```{r add fup}
+
+lab_fup_data <- cases_table1 %>% filter(fup_bin==1)
+
+# Take only the fup results and fup days since jaundice onset. 
+lab_fup_data <- lab_fup_data %>% mutate(days_since_ajs=days_since_ajs_fup)
+lab_fup_data <- lab_fup_data %>% mutate(days_since_symp=days_since_symp_fup)
+
+# Remove the baseline data 
+lab_fup_data <- lab_fup_data %>% select(-baseline_pcr_result, -baseline_igm_result)
+
+# Make the fup results seem like just another baseline obs
+lab_fup_data <- lab_fup_data %>% dplyr::rename(baseline_igm_result=fup_igm_result,
+                                         baseline_pcr_result=fup_pcr_result)
+
+# Remove those with indeterminate values
+lab_fup_data <- lab_fup_data %>% filter(baseline_igm_result!=2)
+
+lab_fup_data <- lab_fup_data %>% select(pat_id, baseline_pcr_result, baseline_igm_result, age, age_group_simple, id_sex, days_since_ajs, days_since_symp, month1, month2, month3, month4, month5, month6, month7, month8, month9, month10, month1_symp, month2_symp, month3_symp, month4_symp, month5_symp, month6_symp, month7_symp, month8_symp, month9_symp, month10_symp)
+
+lab_fup_data <- lab_fup_data %>%
+  mutate(
+    age_group_simple = as.factor(age_group_simple),
+    id_sex = as.factor(id_sex)
+  )
+
+# Make case_hevrdt negative to track which ones are fup visits that are missing RDT
+lab_fup_data <- lab_fup_data %>% mutate(case_hevrdt=-1)
+
+```
+
+```{r prep_dat2}
+
+# Prepare observed data: make it 0/1 for negative/positive
+observed_results2 <- cases_table1 %>% select(case_type_gran,  baseline_igm_result, baseline_pcr_result, case_hevrdt, age, age_group_simple, id_sex, days_since_ajs_baseline, days_since_symp_baseline, pat_id, month1, month2, month3, month4, month5, month6, month7, month8, month9, month10, month1_symp, month2_symp, month3_symp, month4_symp, month5_symp, month6_symp, month7_symp, month8_symp, month9_symp, month10_symp) 
+
+# Rename days since ajs and days since symptoms
+observed_results2 <- observed_results2 %>% dplyr::rename(days_since_ajs=days_since_ajs_baseline)
+
+observed_results2 <- observed_results2 %>% dplyr::rename(days_since_symp=days_since_symp_baseline)
+
+# Make RDT results numeric
+observed_results2 <- observed_results2 %>%
+  mutate(case_hevrdt = case_when(
+     case_hevrdt == "Negative" ~ "0",
+     case_hevrdt == "Positive" ~ "1",
+    TRUE ~ NA_character_
+  )) %>% mutate(case_hevrdt=as.numeric(case_hevrdt))
+
+# Merge in the fup lab visits
+observed_results2 <- observed_results2 %>% bind_rows(lab_fup_data)
+
+# Replace days since jaundice=0 with 0.5. Do the same for symptom onset
+observed_results2 <- observed_results2 %>% mutate(days_since_ajs=ifelse(days_since_ajs==0, 0.5, days_since_ajs))
+
+observed_results2 <- observed_results2 %>% mutate(days_since_symp=ifelse(days_since_symp==0, 0.5, days_since_symp))
+
+# Remove if missing days since AJS
+observed_results2 <- observed_results2 %>% filter(is.na(days_since_ajs)==FALSE)
+
+# Global spline with no knots
+observed_results2 <- observed_results2 %>% mutate(days_since_ajs_sp = poly(days_since_ajs, degree = 3, raw = TRUE))
+
+# Create a person variable in the observed data. Will need this later when estimating posterior probability of infection by test result combination
+observed_results2 <- observed_results2 %>% mutate(person=row_number())
+
+# Make a variable for frequency of days since jaundice onset, will need this for rug plots later
+observed_results2 <- observed_results2 %>%
+  group_by(days_since_ajs) %>%
+  mutate(freq = n()) %>%
+  ungroup()
+
+# Extract the spline basis
+spline_basis <- as.matrix(observed_results2$days_since_ajs_sp)
+
+# Create covariates
+days_since_onset <- observed_results2 %>% select(days_since_ajs)
+
+# Using month of AJS onset
+month1 <- observed_results2 %>% select(month1)
+month2 <- observed_results2 %>% select(month2)
+month3 <- observed_results2 %>% select(month3)
+month4 <- observed_results2 %>% select(month4)
+month5 <- observed_results2 %>% select(month5)
+month6 <- observed_results2 %>% select(month6)
+month7 <- observed_results2 %>% select(month7)
+month8 <- observed_results2 %>% select(month8)
+month9 <- observed_results2 %>% select(month9)
+month10 <- observed_results2 %>% select(month10)
+
+# Pull out sex variable
+sex <- observed_results2 %>% select(id_sex)
+
+# Binned age variable
+observed_results2 <- observed_results2 %>% mutate(age_bin=ifelse(age<=5,1,0))
+age_bin <- observed_results2 %>% select(age_bin)
+
+# Create an interaction variable between age and days since AJS
+observed_results2 <- observed_results2 %>% mutate(age_days = age_bin*days_since_ajs)
+age_days <- observed_results2 %>% select(age_days)
+
+# Create an indicator variable for whether RDT results are real or fake
+observed_results2 <- observed_results2 %>% mutate(indicat=ifelse(case_hevrdt==-1,1,0))
+
+# If indicat is 0, it will undergo the normal likelihood calculation. If indicat is 1, it will process the fake results
+observed_results2 <- observed_results2 %>% mutate(case_hevrdt_pos=ifelse(indicat==0,case_hevrdt,1))
+observed_results2 <- observed_results2 %>% mutate(case_hevrdt_neg=ifelse(indicat==0,case_hevrdt,0))
+
+# Replace -1 values as missing
+observed_results2 <- observed_results2 %>% mutate(case_hevrdt=ifelse(case_hevrdt==-1,NA,case_hevrdt))
+
+indicat <- as.integer(observed_results2$indicat)
+
+```
+
+```{r complete}
+
+# For complete obs
+observed_results2 <- observed_results2 %>% mutate(case_type_gran = case_when(
+  baseline_pcr_result==0 & case_hevrdt==0 & baseline_igm_result ==0 ~ "PCR-,RDT-,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt==0 & baseline_igm_result ==1 ~ "PCR-,RDT-,ELISA+",
+  baseline_pcr_result==0 & case_hevrdt==1 & baseline_igm_result ==0 ~ "PCR-,RDT+,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt==1 & baseline_igm_result ==1 ~ "PCR-,RDT+,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt==0 & baseline_igm_result ==0 ~ "PCR+,RDT-,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt==0 & baseline_igm_result ==1 ~ "PCR+,RDT-,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt==1 & baseline_igm_result ==0 ~ "PCR+,RDT+,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt==1 & baseline_igm_result ==1 ~ "PCR+,RDT+,ELISA+",
+  TRUE ~ NA_character_)) %>% mutate(case_type_gran=factor(case_type_gran, levels= c( "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+")))
+
+# For obs with positive fake RDT. FULL dataset, but assumed all missing RDT were positive
+observed_results2 <- observed_results2 %>% mutate(case_type_gran_pos = case_when(
+  baseline_pcr_result==0 & case_hevrdt_pos==0 & baseline_igm_result ==0 ~ "PCR-,RDT-,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_pos==0 & baseline_igm_result ==1 ~ "PCR-,RDT-,ELISA+",
+  baseline_pcr_result==0 & case_hevrdt_pos==1 & baseline_igm_result ==0 ~ "PCR-,RDT+,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_pos==1 & baseline_igm_result ==1 ~ "PCR-,RDT+,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_pos==0 & baseline_igm_result ==0 ~ "PCR+,RDT-,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_pos==0 & baseline_igm_result ==1 ~ "PCR+,RDT-,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_pos==1 & baseline_igm_result ==0 ~ "PCR+,RDT+,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_pos==1 & baseline_igm_result ==1 ~ "PCR+,RDT+,ELISA+",
+  TRUE ~ case_type_gran)) %>% mutate(case_type_gran_pos=factor(case_type_gran_pos, levels= c( "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+")))
+
+# For obs with negative fake RDT. FULL dataset, but assumed all missing RDT were negative
+observed_results2 <- observed_results2 %>% mutate(case_type_gran_neg = case_when(
+  baseline_pcr_result==0 & case_hevrdt_neg==0 & baseline_igm_result ==0 ~ "PCR-,RDT-,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_neg==0 & baseline_igm_result ==1 ~ "PCR-,RDT-,ELISA+",
+  baseline_pcr_result==0 & case_hevrdt_neg==1 & baseline_igm_result ==0 ~ "PCR-,RDT+,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_neg==1 & baseline_igm_result ==1 ~ "PCR-,RDT+,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_neg==0 & baseline_igm_result ==0 ~ "PCR+,RDT-,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_neg==0 & baseline_igm_result ==1 ~ "PCR+,RDT-,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_neg==1 & baseline_igm_result ==0 ~ "PCR+,RDT+,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_neg==1 & baseline_igm_result ==1 ~ "PCR+,RDT+,ELISA+",
+  TRUE ~ case_type_gran)) %>% mutate(case_type_gran_neg=factor(case_type_gran_neg, levels= c( "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+")))
+```
+
+Create the arrays:
+
+```{r array}
+
+# Create an array manually. 
+
+# All positive RDT
+temp_pos <- array(0, dim = c(1251, 8))
+temp_pos <- as.data.frame(observed_results2$case_type_gran_pos)
+temp_pos <- temp_pos %>% dplyr::rename(classified_result=`observed_results2$case_type_gran_pos`)
+temp_pos <- temp_pos %>% mutate(V1=ifelse(classified_result=="PCR-,RDT-,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V2=ifelse(classified_result=="PCR-,RDT-,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V3=ifelse(classified_result=="PCR-,RDT+,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V4=ifelse(classified_result=="PCR-,RDT+,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V5=ifelse(classified_result=="PCR+,RDT-,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V6=ifelse(classified_result=="PCR+,RDT-,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V7=ifelse(classified_result=="PCR+,RDT+,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V8=ifelse(classified_result=="PCR+,RDT+,ELISA+",1,0))
+
+temp_pos <- temp_pos %>% select(-classified_result)
+observed_results_array_pos <- array(unlist(temp_pos), dim = dim(temp_pos))
+observed_results_tests_pos <- observed_results2 %>% select(baseline_pcr_result, case_hevrdt_pos, baseline_igm_result)
+
+# All negative RDT
+temp_neg <- array(0, dim = c(1251, 8))
+temp_neg <- as.data.frame(observed_results2$case_type_gran_neg)
+temp_neg <- temp_neg %>% dplyr::rename(classified_result=`observed_results2$case_type_gran_neg`)
+temp_neg <- temp_neg %>% mutate(V1=ifelse(classified_result=="PCR-,RDT-,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V2=ifelse(classified_result=="PCR-,RDT-,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V3=ifelse(classified_result=="PCR-,RDT+,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V4=ifelse(classified_result=="PCR-,RDT+,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V5=ifelse(classified_result=="PCR+,RDT-,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V6=ifelse(classified_result=="PCR+,RDT-,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V7=ifelse(classified_result=="PCR+,RDT+,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V8=ifelse(classified_result=="PCR+,RDT+,ELISA+",1,0))
+
+temp_neg <- temp_neg %>% select(-classified_result)
+observed_results_array_neg <- array(unlist(temp_neg), dim = dim(temp_neg))
+
+observed_results_tests_neg <- observed_results2 %>% select(baseline_pcr_result, case_hevrdt_neg, baseline_igm_result)
+
+```
+
+```{r func}
+
+# Define a function to automate the process
+process_draws <- function(draws) {
+  
+  # Add ID
+  draws <- draws %>% mutate(id=row_number())
+  
+  # Step 2: Isolate sensitivity data for each test (PCR, RDT, ELISA)
+sens_pcr <- draws %>% 
+  select(matches("sens_all\\[\\d+,1\\]"))
+
+sens_rdt <- draws %>% 
+  select(matches("sens_all\\[\\d+,2\\]"))
+
+sens_elisa <- draws %>% 
+  select(matches("sens_all\\[\\d+,3\\]"))
+  
+  # Step 3: Isolate specificity data for each test (PCR, RDT, ELISA)
+draws$spec_pcr <- (draws$`spec_all[1]`)
+draws$spec_rdt <- (draws$`spec_all[2]`)
+draws$spec_elisa <- (draws$`spec_all[3]`)
+  
+# Add average ACROSS individuals
+draws$average_sens_pcr <- rowMeans(sens_pcr, na.rm = TRUE)
+draws$average_sens_rdt <- rowMeans(sens_rdt, na.rm = TRUE)
+draws$average_sens_elisa <- rowMeans(sens_elisa, na.rm = TRUE)
+
+  return(draws)
+}
+
+# Create a function for the models that also allow phi to vary by time 
+process_draws_time <- function(draws) {
+  
+  # Add ID
+  draws <- draws %>% mutate(id=row_number())
+
+  #  Isolate sensitivity data for each test (PCR, RDT, ELISA)
+sens_pcr <- draws %>% 
+  select(matches("sens_all\\[\\d+,1\\]"))
+
+sens_rdt <- draws %>% 
+  select(matches("sens_all\\[\\d+,2\\]"))
+
+sens_elisa <- draws %>% 
+  select(matches("sens_all\\[\\d+,3\\]"))
+  
+  # Step 3: Isolate specificity data for each test (PCR, RDT, ELISA)
+draws$spec_pcr <- (draws$`spec_all[1]`)
+draws$spec_rdt <- (draws$`spec_all[2]`)
+draws$spec_elisa <- (draws$`spec_all[3]`)
+  
+# Step 4: Isole phi data
+phi <- draws %>%
+  select(starts_with("phi[")) 
+
+# Add average ACROSS individuals
+draws$average_sens_pcr <- rowMeans(sens_pcr, na.rm = TRUE)
+draws$average_sens_rdt <- rowMeans(sens_rdt, na.rm = TRUE)
+draws$average_sens_elisa <- rowMeans(sens_elisa, na.rm = TRUE)
+draws$average_phi <- rowMeans(phi, na.rm = TRUE)
+  
+  return(draws)
+}
+
+options(mc.cores=parallel::detectCores())
+
+```
+
+The outcome of interest for the latent class model is the individual likelihood of hepatitis E conditional on test results:
+
+\[P(Infection~|~Test Results) = \frac{P(Test~results~|~Infection) * P(Infection))}{P(Test~results)} \]
+
+The likelihood for a given sequence of test results (excluding ALT/AST) follows a multinomial likelihood. Given 3 tests (PCR, rapid test, ELISA), there are 8 possible sequences:
+
+
+\[n_{(-,-,-)}, n_{(-,-,+)}, n_{(-,+,-)}, n_{(-,+,+)}, n_{(+,-,-)}, n_{(+,-,+)}, n_{(+,+,-)}, n_{(+,+,+)}   --> multinomial(p_{(-,-,-)}, p_{(-,-,+)}, p_{(-,+,-)}, p_{(-,+,+)}, p_{(+,-,-)}, p_{(+,-,+)}, p_{(+,+,-)}, p_{(+,+,+)})\]
+
+\[p(-,-,-) = (1-\theta^+_1)(1-\theta^+_2)(1-\theta^+_3)\phi + \theta^-_1 \theta^-_2 \theta^-_3(1-\phi)\]
+\[p(-,-,+) = (1-\theta^+_1)(1-\theta^+_2)\theta^+_3\phi + \theta^-_1 \theta^-_2 (1-\theta^-_3)(1-\phi)\]
+\[p(-,+,-) = (1-\theta^+_1)\theta^+_2(1-\theta^+_3)\phi + \theta^-_1 (1-\theta^-_2) \theta^-_3(1-\phi)\]
+\[p(-,+,+) = (1-\theta^+_1)\theta^+_2\theta^+_3\phi + \theta^-_1 (1-\theta^-_2) (1-\theta^-_3)(1-\phi)\]
+\[p(+,-,-) = \theta^+_1(1-\theta^+_2)(1-\theta^+_3)\phi + (1-\theta^-_1) \theta^-_2 \theta^-_3(1-\phi)\]
+\[p(+,-,+) = \theta^+_1(1-\theta^+_2)\theta^+_3\phi + (1-\theta^-_1) \theta^-_2 (1-\theta^-_3)(1-\phi)\]
+\[p(+,+,-) = \theta^+_1\theta^+_2(1-\theta^+_3)\phi + (1-\theta^-_1) (1-\theta^-_2) \theta^-_3(1-\phi)\]
+\[p(+,+,+) = \theta^+_1\theta^+_2\theta^+_3\phi + (1-\theta^-_1)(1-\theta^-_2) (1-\theta^-_3)(1-\phi)\]
+
+Run the unadjusted model: model 0. Not allowing sensitivity/specificity to vary 
+```{r m0, echo=FALSE}
+
+stan_data_m0 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+indicat = indicat,
+prior_hev_missing=.2)
+
+# Compile the Stan model
+file_dat <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m0.stan"))
+
+mod_dat <- stan_model(file_dat)
+
+fit_m0 <- sampling(mod_dat,
+                data = stan_data_m0,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+) 
+
+saveRDS(fit_m0, file = "fit_m0.rds")
+
+# Run LOO
+loo_m0 <- loo(fit_m0, pars = "log_lik") 
+saveRDS(loo_m0, file = "loo_m0.rds")
+
+# Process draws
+draws <- as.data.frame(fit_m0)
+draws <- draws %>% mutate(id=row_number())
+
+# True infection probability
+mean(draws$phi)
+quantile(draws$phi, c((1 - credible_level) / 2))
+quantile(draws$phi, c(1 - (1 - credible_level) / 2))
+
+# PCR: Sensitivity
+mean(draws$`sens_all[1]`)
+quantile(draws$`sens_all[1]`, c((1 - credible_level) / 2))
+quantile(draws$`sens_all[1]`, c(1 - (1 - credible_level) / 2))
+
+# PCR: Specificity
+mean(draws$`spec_all[1]`)
+quantile(draws$`spec_all[1]`, c((1 - credible_level) / 2))
+quantile(draws$`spec_all[1]`, c(1 - (1 - credible_level) / 2))
+
+# RDT: Sensitivity
+mean(draws$`sens_all[2]`)
+quantile(draws$`sens_all[2]`, c((1 - credible_level) / 2))
+quantile(draws$`sens_all[2]`, c(1 - (1 - credible_level) / 2))
+
+# RDT: Specificity
+mean(draws$`spec_all[2]`)
+quantile(draws$`spec_all[2]`, c((1 - credible_level) / 2))
+quantile(draws$`spec_all[2]`, c(1 - (1 - credible_level) / 2))
+
+# ELISA: Sensitivity
+mean(draws$`sens_all[3]`)
+quantile(draws$`sens_all[3]`, c((1 - credible_level) / 2))
+quantile(draws$`sens_all[3]`, c(1 - (1 - credible_level) / 2))
+
+# ELISA: Specificity
+mean(draws$`spec_all[3]`)
+quantile(draws$`spec_all[3]`, c((1 - credible_level) / 2))
+quantile(draws$`spec_all[3]`, c(1 - (1 - credible_level) / 2))
+
+```
+
+Run the unadjusted model that allows phi to vary over time:
+
+```{r m0t, echo=FALSE}
+
+stan_data_m0t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+# Compile the Stan model
+file_dat_0t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m0_time.stan"))
+
+# Rstan
+mod_dat_0t <- stan_model(file_dat_0t)
+
+fit_m0t <- sampling(mod_dat_0t,
+                data = stan_data_m0t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE) 
+
+saveRDS(fit_m0t, file = "fit_m0t.rds")
+
+# Run LOO
+loo_m0t1 <- loo(fit_m0t, pars = "log_lik") 
+saveRDS(loo_m0t1, file = "loo_m0t1.rds")
+
+# Process draws
+draws_m0_t <- as.data.frame(fit_m0t)
+draws_m0_t <- draws_m0_t %>% mutate(id=row_number())
+
+# Isolate p1-p8
+p_data_m0_t <- draws_m0_t %>%
+  select(starts_with("p["))
+
+p1_dat_m0_t <- p_data_m0_t %>% select(matches(",1]$"))
+p2_dat_m0_t <- p_data_m0_t %>% select(matches(",2]$"))
+p3_dat_m0_t <- p_data_m0_t %>% select(matches(",3]$"))
+p4_dat_m0_t <- p_data_m0_t %>% select(matches(",4]$"))
+p5_dat_m0_t <- p_data_m0_t %>% select(matches(",5]$"))
+p6_dat_m0_t <- p_data_m0_t %>% select(matches(",6]$"))
+p7_dat_m0_t <- p_data_m0_t %>% select(matches(",7]$"))
+p8_dat_m0_t <- p_data_m0_t %>% select(matches(",8]$"))
+
+# No need to average across individuals for sensitivity or specificity
+draws_m0_t$sens_pcr <- (draws_m0_t$`sens_all[1]`)
+draws_m0_t$sens_rdt <- (draws_m0_t$`sens_all[2]`)
+draws_m0_t$sens_elisa <- (draws_m0_t$`sens_all[3]`)
+
+draws_m0_t$spec_pcr <- (draws_m0_t$`spec_all[1]`)
+draws_m0_t$spec_rdt <- (draws_m0_t$`spec_all[2]`)
+draws_m0_t$spec_elisa <- (draws_m0_t$`spec_all[3]`)
+
+# Isolate phi data
+phi_m0_t <- draws_m0_t %>%
+  select(starts_with("phi[")) 
+
+# Now need to do this for phi also
+phi_m0_t$average_phi <- rowMeans(phi_m0_t, na.rm = TRUE)
+
+# # True infection probability
+mean(phi_m0_t$average_phi)
+quantile(phi_m0_t$average_phi, c((1 - credible_level) / 2))
+quantile(phi_m0_t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # # PCR: Sensitivity
+mean(draws_m0_t$sens_pcr)
+quantile(draws_m0_t$sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m0_t$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m0_t$spec_pcr)
+quantile(draws_m0_t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m0_t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # # RDT: Sensitivity
+mean(draws_m0_t$sens_rdt)
+quantile(draws_m0_t$sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m0_t$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m0_t$spec_rdt)
+quantile(draws_m0_t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m0_t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m0_t$sens_elisa)
+quantile(draws_m0_t$sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m0_t$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m0_t$spec_elisa)
+quantile(draws_m0_t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m0_t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+#  Adjusted models
+
+Model 1: Only adjusting for days since jaundice onset (linear) for sensitivity 
+
+```{r m1}
+
+stan_data_m1 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m1 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m1.stan"))
+
+mod_dat_m1 <- stan_model(file_dat_m1)
+
+fit_m1 <- sampling(mod_dat_m1,
+                data = stan_data_m1,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m1, file = "fit_m1.rds")
+
+# Run LOO
+# # M1: address high pareto k values with moment matching
+# loo_m1 <- loo(fit_m1, pars = "log_lik")
+loo_m1 <- loo(fit_m1,  moment_match = TRUE, pars = "log_lik")
+saveRDS(loo_m1, file = "loo_m1.rds")
+
+draws_m1 <- as.data.frame(fit_m1)
+
+draws_m1<- process_draws_time(draws_m1)
+
+# True infection probability
+mean(draws_m1$phi)
+quantile(draws_m1$phi, c((1 - credible_level) / 2))
+quantile(draws_m1$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m1$average_sens_pcr)
+quantile(draws_m1$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m1$spec_pcr)
+quantile(draws_m1$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m1$average_sens_rdt)
+quantile(draws_m1$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+ mean(draws_m1$spec_rdt)
+quantile(draws_m1$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m1$average_sens_elisa)
+quantile(draws_m1$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m1$spec_elisa)
+quantile(draws_m1$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m1 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m1 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m1 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 1t: Linear for all tests with time varying phi
+
+```{r m1t}
+
+stan_data_m1t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+file_dat_m1t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m1_time.stan"))
+
+mod_dat_m1_t <- stan_model(file_dat_m1t)
+
+fit_m1t <- sampling(mod_dat_m1_t,
+                data = stan_data_m1t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+) 
+
+saveRDS(fit_m1t, file = "fit_m1t.rds")
+
+# Run LOO
+loo_m1t1 <- loo(fit_m1t, pars = "log_lik")
+saveRDS(loo_m1t1, file = "loo_m1t1.rds")
+
+# Process draws
+draws_m1_t <- as.data.frame(fit_m1t)
+
+draws_m1_t <- process_draws_time(draws_m1_t)
+
+# True infection probability
+mean(draws_m1_t$average_phi)
+quantile(draws_m1_t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m1_t$average_sens_pcr)
+quantile(draws_m1_t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m1_t$spec_pcr)
+quantile(draws_m1_t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1_t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m1_t$average_sens_rdt)
+quantile(draws_m1_t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m1_t$spec_rdt)
+quantile(draws_m1_t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1_t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m1_t$average_sens_elisa)
+quantile(draws_m1_t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m1_t$spec_elisa)
+quantile(draws_m1_t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1_t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m1_t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m1_t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m1_t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 2: Natural cubic spline for days since jaundice onset for all tests. 
+
+```{r m2, echo=FALSE}
+
+stan_data_m2 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+spline_basis = spline_basis,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m2 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m2.stan"))
+
+mod_dat_m2 <- stan_model(file_dat_m2)
+
+fit_m2 <- sampling(mod_dat_m2,
+                data = stan_data_m2,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+) 
+
+
+saveRDS(fit_m2, file = "fit_m2.rds")
+
+# Run LOO
+# loo_m2 <- loo(fit_m2, pars = "log_lik")
+loo_m2 <- loo(fit_m2,  moment_match = TRUE, pars = "log_lik")
+saveRDS(loo_m2, file = "loo_m2.rds")
+
+# Process draws
+draws_m2 <- as.data.frame(fit_m2)
+draws_m2 <- process_draws(draws_m2)
+
+# True infection probability
+mean(draws_m2$phi)
+quantile(draws_m2$phi, c((1 - credible_level) / 2))
+quantile(draws_m2$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m2$average_sens_pcr)
+quantile(draws_m2$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m2$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m2$spec_pcr)
+quantile(draws_m2$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m2$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m2$average_sens_rdt)
+quantile(draws_m2$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m2$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m2$spec_rdt)
+quantile(draws_m2$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m2$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m2$average_sens_elisa)
+quantile(draws_m2$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m2$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m2$spec_elisa)
+quantile(draws_m2$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m2$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m2 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m2 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m2 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model m2t: m2 but with with time varying phi
+
+```{r m2 time, echo=FALSE}
+
+stan_data_m2_t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+  spline_basis = spline_basis,
+  indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+file_dat_m2_t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m2t.stan"))
+
+mod_dat_m2_t <- stan_model(file_dat_m2_t)
+
+fit_m2t <- sampling(mod_dat_m2_t,
+                data = stan_data_m2_t,
+                iter = 3000,          # Total number of iterations (warmup + sampling)
+                warmup = 1500,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+) 
+
+# Diagnostics 
+saveRDS(fit_m2t, file = "fit_m2t_marg.rds")
+
+# Run LOO
+loo_m2t1 <- loo(fit_m2t, pars = "log_lik")
+saveRDS(loo_m2t1, file = "loo_m2t.rds")
+
+draws_m2_t <- as.data.frame(fit_m2t)
+draws_m2_t <- process_draws_time(draws_m2_t)
+
+# True infection probability
+mean(draws_m2_t$average_phi)
+quantile(draws_m2_t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m2_t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m2_t$average_sens_pcr)
+quantile(draws_m2_t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m2_t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m2_t$spec_pcr)
+quantile(draws_m2_t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m2_t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m2_t$average_sens_rdt)
+quantile(draws_m2_t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m2_t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m2_t$spec_rdt)
+quantile(draws_m2_t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m2_t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m2_t$average_sens_elisa)
+quantile(draws_m2_t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m2_t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m2_t$spec_elisa)
+quantile(draws_m2_t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m2_t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 5a: PCR cubic spline, RDT continuous, ELISA continuous
+
+```{r m5a}
+
+stan_data_m5a <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+spline_basis = spline_basis,
+prior_hev_missing=.2)
+
+file_dat_m5a <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m5a.stan"))
+
+mod_dat_m5a <- stan_model(file_dat_m5a)
+
+fit_m5a <- sampling(mod_dat_m5a ,
+                data = stan_data_m5a,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m5a, file = "fit_m5a.rds")
+
+# Run LOO
+# loo_m5 <- loo(fit_m5a, pars = "log_lik")
+loo_m5 <- loo(fit_m5a,  moment_match = TRUE, pars = "log_lik")
+saveRDS(loo_m5, file = "loo_m5a.rds")
+
+# Process draws
+draws_m5 <- as.data.frame(fit_m5a)
+draws_m5 <- process_draws(draws_m5)
+
+# True infection probability
+mean(draws_m5$phi)
+quantile(draws_m5$phi, c((1 - credible_level) / 2))
+quantile(draws_m5$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m5$average_sens_pcr)
+quantile(draws_m5$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m5$spec_pcr)
+quantile(draws_m5$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m5$average_sens_rdt)
+quantile(draws_m5$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m5$spec_rdt)
+quantile(draws_m5$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m5$average_sens_elisa)
+quantile(draws_m5$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m5$spec_elisa)
+quantile(draws_m5$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m5 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m5 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m5 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 5b: PCR cubic spline, no adjustment for RDT or ELISA
+
+```{r m5b}
+
+stan_data_m5b <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+  spline_basis = spline_basis,
+  indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m5b <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m5b.stan"))
+
+mod_dat_m5b <- stan_model(file_dat_m5b)
+
+fit_m5b <- sampling(mod_dat_m5b ,
+                data = stan_data_m5b,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m5b, file = "fit_m5b.rds")
+
+# Run LOO
+loo_m5b <- loo(fit_m5b, pars = "log_lik") 
+saveRDS(loo_m5b, file = "loo_m5b.rds")
+
+# Process draws
+draws_m5b <- as.data.frame(fit_m5b)
+draws_m5b <- process_draws(draws_m5b)
+
+# True infection probability
+mean(draws_m5b$phi)
+quantile(draws_m5b$phi, c((1 - credible_level) / 2))
+quantile(draws_m5b$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m5b$average_sens_pcr)
+quantile(draws_m5b$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5b$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m5b$spec_pcr)
+quantile(draws_m5b$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5b$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m5b$average_sens_rdt)
+quantile(draws_m5b$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5b$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m5b$spec_rdt)
+quantile(draws_m5b$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5b$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m5b$average_sens_elisa)
+quantile(draws_m5b$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5b$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m5b$spec_elisa)
+quantile(draws_m5b$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5b$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m5b %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m5b %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m5b %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 5bt: m5b but with time varying phi
+
+```{r m5bt}
+
+stan_data_m5b_t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+  spline_basis = spline_basis,
+  indicat = indicat,
+  month1 = month1, 
+  month2 = month2, 
+  month3 = month3, 
+  month4 = month4, 
+  month5 = month5, 
+  month6 = month6, 
+  month7 = month7, 
+  month8 = month8, 
+  month9 = month9, 
+  month10 = month10, 
+prior_hev_missing=.2)
+
+file_dat_m5b_t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m5b_time.stan"))
+
+mod_dat_m5b_t <- stan_model(file_dat_m5b_t)
+
+fit_m5bt <- sampling(mod_dat_m5b_t ,
+                data = stan_data_m5b_t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m5bt, file = "fit_m5bt.rds")
+
+# Run LOO
+loo_m5bt1 <- loo(fit_m5bt, pars = "log_lik")
+saveRDS(loo_m5bt1, file = "loo_m5bt1.rds")
+
+draws_m5b_t <- as.data.frame(fit_m5bt)
+draws_m5b_t <- process_draws_time(draws_m5b_t)
+
+# # True infection probability
+mean(draws_m5b_t$average_phi)
+quantile(draws_m5b_t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m5b_t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m5b_t$average_sens_pcr)
+quantile(draws_m5b_t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5b_t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m5b_t$spec_pcr)
+quantile(draws_m5b_t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5b_t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m5b_t$average_sens_rdt)
+quantile(draws_m5b_t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5b_t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m5b_t$spec_rdt)
+quantile(draws_m5b_t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5b_t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m5b_t$average_sens_elisa)
+quantile(draws_m5b_t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5b_t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m5b_t$spec_elisa)
+quantile(draws_m5b_t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5b_t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m5b_t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m5b_t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m5b_t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 5c: PCR does not adjust for days since jaundice onset, RDT and ELISA continuous
+
+```{r m5c}
+
+stan_data_m5c <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m5c <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m5c.stan"))
+
+mod_dat_m5c <- stan_model(file_dat_m5c)
+
+fit_m5c <- sampling(mod_dat_m5c ,
+                data = stan_data_m5c,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m5c, file = "fit_m5c.rds")
+
+# Run LOO
+loo_m5c <- loo(fit_m5c, pars = "log_lik") 
+saveRDS(loo_m5c, file = "loo_m5c.rds")
+
+draws_m5c <- as.data.frame(fit_m5c)
+draws_m5c <- process_draws(draws_m5c)
+
+# True infection probability
+mean(draws_m5c$phi)
+quantile(draws_m5c$phi, c((1 - credible_level) / 2))
+quantile(draws_m5c$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m5c$average_sens_pcr)
+quantile(draws_m5c$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5c$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m5c$spec_pcr)
+quantile(draws_m5c$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5c$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m5c$average_sens_rdt)
+quantile(draws_m5c$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5c$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m5c$spec_rdt)
+quantile(draws_m5c$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5c$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m5c$average_sens_elisa)
+quantile(draws_m5c$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5c$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m5c$spec_elisa)
+quantile(draws_m5c$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5c$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m5c %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m5c %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m5c %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 5ct: m5c but with time varying phi
+
+```{r m5ct}
+
+stan_data_m5ct <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+month1 = month1,
+month2 = month2,
+month3 = month3,
+month4 = month4,
+month5 = month5,
+month6 = month6,
+month7 = month7,
+month8 = month8,
+month9 = month9,
+month10 = month10,
+prior_hev_missing=.2)
+
+file_dat_m5ct <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m5ctime.stan"))
+
+mod_dat_m5ct <- stan_model(file_dat_m5ct)
+
+fit_m5ct <- sampling(mod_dat_m5ct ,
+                data = stan_data_m5ct,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m5ct, file = "fit_m5ct.rds")
+
+# Run LOO
+loo_m5ct1 <- loo(fit_m5ct, pars = "log_lik")
+saveRDS(loo_m5ct1, file = "loo_m5ct1.rds")
+
+# Process draws
+draws_m5ct <- as.data.frame(fit_m5ct)
+draws_m5ct <- process_draws_time(draws_m5ct)
+
+# # True infection probability
+mean(draws_m5ct $average_phi)
+quantile(draws_m5ct $average_phi, c((1 - credible_level) / 2))
+quantile(draws_m5ct $average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m5ct$average_sens_pcr)
+quantile(draws_m5ct$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5ct$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m5ct$spec_pcr)
+quantile(draws_m5ct$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5ct$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m5ct$average_sens_rdt)
+quantile(draws_m5ct$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5ct$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m5ct$spec_rdt)
+quantile(draws_m5ct$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5ct$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m5ct$average_sens_elisa)
+quantile(draws_m5ct$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5ct$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m5ct$spec_elisa)
+quantile(draws_m5ct$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5ct$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m5ct %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m5ct %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m5ct %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 5d: PCR continuous, RDT NOTHING, ELISA continuous, with time varying phi
+
+```{r m5dt}
+
+stan_data_m5dt <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+file_dat_m5dt <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m5dtime.stan"))
+
+mod_dat_m5dt <- stan_model(file_dat_m5dt)
+
+fit_m5dt <- sampling(mod_dat_m5dt ,
+                data = stan_data_m5dt,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m5dt, file = "fit_m5dt.rds")
+
+# Run LOO
+loo_m5dt1 <- loo(fit_m5dt, pars = "log_lik")
+saveRDS(loo_m5dt1, file = "loo_m5dt1.rds")
+
+# Process draws
+draws_m5dt <- as.data.frame(fit_m5dt)
+draws_m5dt <- process_draws_time(draws_m5dt)
+
+# # True infection probability
+mean(draws_m5dt$average_phi)
+quantile(draws_m5dt$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m5dt$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m5dt$average_sens_pcr)
+quantile(draws_m5dt$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5dt$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m5dt$spec_pcr)
+quantile(draws_m5dt$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m5dt$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m5dt$average_sens_rdt)
+quantile(draws_m5dt$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5dt$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m5dt$spec_rdt)
+quantile(draws_m5dt$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m5dt$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m5dt$average_sens_elisa)
+quantile(draws_m5dt$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5dt$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m5dt$spec_elisa)
+quantile(draws_m5dt$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m5dt$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m5dt %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m5dt %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m5dt %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 6: PCR continuous, RDT cubic spline, ELISA continuous
+
+```{r m6}
+
+stan_data_m6 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+spline_basis = spline_basis,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m6 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m6.stan"))
+
+mod_dat_m6 <- stan_model(file_dat_m6)
+
+fit_m6 <- sampling(mod_dat_m6 ,
+                data = stan_data_m6,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m6, file = "fit_m6.rds")
+
+# Run LOO
+loo_m6 <- loo(fit_m6, pars = "log_lik") 
+saveRDS(loo_m6, file = "loo_m6.rds")
+
+# Process draws
+draws_m6 <- as.data.frame(fit_m6)
+draws_m6 <- process_draws(draws_m6)
+
+# True infection probability
+mean(draws_m6$phi)
+quantile(draws_m6$phi, c((1 - credible_level) / 2))
+quantile(draws_m6$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m6$average_sens_pcr)
+quantile(draws_m6$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m6$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m6$spec_pcr)
+quantile(draws_m6$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m6$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m6$average_sens_rdt)
+quantile(draws_m6$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m6$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m6$spec_rdt)
+quantile(draws_m6$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m6$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m6$average_sens_elisa)
+quantile(draws_m6$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m6$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m6$spec_elisa)
+quantile(draws_m6$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m6$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m6 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m6 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m6 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 7: PCR continuous, RDT continuous, ELISA cubic spline
+
+```{r m7}
+
+stan_data_m7 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+spline_basis = spline_basis,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m7 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m7.stan"))
+
+mod_dat_m7 <- stan_model(file_dat_m7)
+
+fit_m7 <- sampling(mod_dat_m7 ,
+                data = stan_data_m7,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m7, file = "fit_m7.rds")
+
+# Run LOO
+# loo_m7 <- loo(fit_m7, pars = "log_lik") 
+loo_m7 <- loo(fit_m7,  moment_match = TRUE, pars = "log_lik")
+saveRDS(loo_m7, file = "loo_m7.rds")
+
+# Process draws
+draws_m7 <- as.data.frame(fit_m7)
+draws_m7 <- process_draws(draws_m7)
+
+# True infection probability
+mean(draws_m7$phi)
+quantile(draws_m7$phi, c((1 - credible_level) / 2))
+quantile(draws_m7$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m7$average_sens_pcr)
+quantile(draws_m7$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m7$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m7$spec_pcr)
+quantile(draws_m7$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m7$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m7$average_sens_rdt)
+quantile(draws_m7$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m7$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m7$spec_rdt)
+quantile(draws_m7$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m7$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m7$average_sens_elisa)
+quantile(draws_m7$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m7$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m7$spec_elisa)
+quantile(draws_m7$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m7$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m7 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m7 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m7 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 8: m1 but adjusting for sex 
+
+```{r m8, echo=FALSE}
+
+stan_data_m8 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+sex = sex,
+prior_hev_missing=.2)
+
+# Compile the Stan model
+file_dat_m8 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m8.stan"))
+
+mod_dat_m8 <- stan_model(file_dat_m8)
+
+fit_m8 <- sampling(mod_dat_m8 ,
+                data = stan_data_m8,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE)
+
+saveRDS(fit_m8, file = "fit_m8.rds")
+
+# Run LOO
+loo_m8 <- loo(fit_m8, pars = "log_lik") 
+saveRDS(loo_m8, file = "loo_m8.rds")
+
+# Process draws
+draws_m8 <- as.data.frame(fit_m8)
+draws_m8 <- process_draws(draws_m8)
+
+# True infection probability
+mean(draws_m8$phi)
+quantile(draws_m8$phi, c((1 - credible_level) / 2))
+quantile(draws_m8$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m8$average_sens_pcr)
+quantile(draws_m8$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m8$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m8$spec_pcr)
+quantile(draws_m8$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m8$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m8$average_sens_rdt)
+quantile(draws_m8$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m8$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m8$spec_rdt)
+quantile(draws_m8$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m8$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m8$average_sens_elisa)
+quantile(draws_m8$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m8$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m8$spec_elisa)
+quantile(draws_m8$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m8$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m8 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m8 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m8 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 12: No adjustment for PCR , cubic spline for RDT or ELISA
+
+```{r m12}
+
+stan_data_m12 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+spline_basis = spline_basis,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m12 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m12.stan"))
+
+mod_dat_m12 <- stan_model(file_dat_m12)
+
+fit_m12 <- sampling(mod_dat_m12 ,
+                data = stan_data_m12,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m12, file = "fit_m12.rds")
+
+# Run LOO
+loo_m12 <- loo(fit_m12, pars = "log_lik") 
+saveRDS(loo_m12, file = "loo_m12.rds")
+
+# Process draws
+draws_m12 <- as.data.frame(fit_m12)
+draws_m12 <- process_draws(draws_m12)
+
+# True infection probability
+mean(draws_m12$phi)
+quantile(draws_m12$phi, c((1 - credible_level) / 2))
+quantile(draws_m12$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m12$average_sens_pcr)
+quantile(draws_m12$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m12$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m12$spec_pcr)
+quantile(draws_m12$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m12$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m12$average_sens_rdt)
+quantile(draws_m12$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m12$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m12$spec_rdt)
+quantile(draws_m12$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m12$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m12$average_sens_elisa)
+quantile(draws_m12$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m12$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m12$spec_elisa)
+quantile(draws_m12$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m12$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m12 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m12 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m12 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 12t: m12 but with time varying phi
+
+```{r m12t}
+
+stan_data_m12t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+spline_basis = spline_basis,
+indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+file_dat_m12t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m12time.stan"))
+
+mod_dat_m12t <- stan_model(file_dat_m12t)
+
+fit_m12t <- sampling(mod_dat_m12t ,
+                data = stan_data_m12t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m12t, file = "fit_m12t.rds")
+
+# Run LOO
+loo_m12t1 <- loo(fit_m12t, pars = "log_lik")
+saveRDS(loo_m12t1, file = "loo_m12t1.rds")
+
+# Process draws
+draws_m12t <- as.data.frame(fit_m12t)
+draws_m12t <- process_draws_time(draws_m12t)
+
+# True infection probability
+mean(draws_m12t$average_phi)
+quantile(draws_m12t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m12t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m12t$average_sens_pcr)
+quantile(draws_m12t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m12t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m12t$spec_pcr)
+quantile(draws_m12t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m12t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m12t$average_sens_rdt)
+quantile(draws_m12t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m12t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m12t$spec_rdt)
+quantile(draws_m12t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m12t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m12t$average_sens_elisa)
+quantile(draws_m12t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m12t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m12t$spec_elisa)
+quantile(draws_m12t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m12t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m12t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m12t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m12t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 13: PCR continuous, no adjustment for RDT or ELISA
+
+```{r m13}
+
+stan_data_m13 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m13 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m13.stan"))
+
+mod_dat_m13 <- stan_model(file_dat_m13)
+
+fit_m13 <- sampling(mod_dat_m13 ,
+                data = stan_data_m13,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m13, file = "fit_m13.rds")
+
+# Run LOO
+loo_m13 <- loo(fit_m13, pars = "log_lik") 
+saveRDS(loo_m13, file = "loo_m13.rds")
+
+# Process draws
+draws_m13 <- as.data.frame(fit_m13)
+draws_m13 <- process_draws(draws_m13)
+
+# True infection probability
+mean(draws_m13$phi)
+quantile(draws_m13$phi, c((1 - credible_level) / 2))
+quantile(draws_m13$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m13$average_sens_pcr)
+quantile(draws_m13$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m13$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m13$spec_pcr)
+quantile(draws_m13$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m13$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m13$average_sens_rdt)
+quantile(draws_m13$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m13$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m13$spec_rdt)
+quantile(draws_m13$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m13$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m13$average_sens_elisa)
+quantile(draws_m13$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m13$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m13$spec_elisa)
+quantile(draws_m13$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m13$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m13 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m13 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m13 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 13t: m13 but with time varying phi
+
+```{r m13t}
+
+stan_data_m13_t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+file_dat_m13_t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m13_time.stan"))
+
+mod_dat_m13_t <- stan_model(file_dat_m13_t)
+
+fit_m13_t <- sampling(mod_dat_m13_t,
+                data = stan_data_m13_t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m13_t, file = "fit_m13t.rds")
+
+# Run LOO
+loo_m13t1 <- loo(fit_m13_t, pars = "log_lik") 
+saveRDS(loo_m13t1, file = "loo_m13t1.rds")
+
+# Process draws 
+draws_m13_t <- as.data.frame(fit_m13t)
+draws_m13_t <- process_draws_time(draws_m13_t)
+
+# # True infection probability
+mean(draws_m13_t$average_phi)
+quantile(draws_m13_t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m13_t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # # PCR: Sensitivity
+mean(draws_m13_t$average_sens_pcr)
+quantile(draws_m13_t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m13_t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # # PCR: Specificity
+mean(draws_m13_t$spec_pcr)
+quantile(draws_m13_t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m13_t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # # RDT: Sensitivity
+mean(draws_m13_t$average_sens_rdt)
+quantile(draws_m13_t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m13_t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # # RDT: Specificity
+mean(draws_m13_t$spec_rdt)
+quantile(draws_m13_t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m13_t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # # ELISA: Sensitivity
+mean(draws_m13_t$average_sens_elisa)
+quantile(draws_m13_t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m13_t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # # ELISA: Specificity
+mean(draws_m13_t$spec_elisa)
+quantile(draws_m13_t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m13_t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m13_t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m13_t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m13_t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 14: try adjusting for only age and sex, not days since jaundice onset.
+
+```{r m14}
+
+stan_data_m14 <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+age_bin = age_bin,
+sex = sex,
+indicat = indicat,
+prior_hev_missing=.2)
+
+file_dat_m14 <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m14.stan"))
+
+mod_dat_m14 <- stan_model(file_dat_m14)
+
+fit_m14 <- sampling(mod_dat_m14 ,
+                data = stan_data_m14,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+)
+
+saveRDS(fit_m14, file = "fit_m14.rds")
+
+# Run LOO
+loo_m14 <- loo(fit_m14, pars = "log_lik")
+saveRDS(loo_m14, file = "loo_m14.rds")
+
+# Process draws
+draws_m14 <- as.data.frame(fit_m14)
+draws_m14 <- process_draws(draws_m14)
+
+# True infection probability
+mean(draws_m14$phi)
+quantile(draws_m14$phi, c((1 - credible_level) / 2))
+quantile(draws_m14$phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m14$average_sens_pcr)
+quantile(draws_m14$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m14$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m14$spec_pcr)
+quantile(draws_m14$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m14$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m14$average_sens_rdt)
+quantile(draws_m14$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m14$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m14$spec_rdt)
+quantile(draws_m14$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m14$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m14$average_sens_elisa)
+quantile(draws_m14$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m14$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m14$spec_elisa)
+quantile(draws_m14$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m14$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m14 %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m14 %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m14 %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 15t: Allow PCR and RDT to vary linearly, nothing for ELISA, with time varying phi
+
+```{r m15t, echo=FALSE}
+
+stan_data_m15t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+# Compile the Stan model
+file_dat_m15t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m15_time.stan"))
+
+mod_dat_m15t <- stan_model(file_dat_m15t)
+
+fit_m15t <- sampling(mod_dat_m15t ,
+                data = stan_data_m15t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE)
+
+saveRDS(fit_m15t, file = "fit_m15t.rds")
+
+# Run LOO
+loo_m15t1 <- loo(fit_m15t, pars = "log_lik")
+saveRDS(loo_m15t1, file = "loo_m15t.rds")
+
+# Process draws
+draws_m15t <- as.data.frame(fit_m15t)
+draws_m15t <- process_draws_time(draws_m15t)
+
+# True infection probability
+mean(draws_m15t$average_phi)
+quantile(draws_m15t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m15t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m15t$average_sens_pcr)
+quantile(draws_m15t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m15t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m15t$spec_pcr)
+quantile(draws_m15t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m15t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m15t$average_sens_rdt)
+quantile(draws_m15t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m15t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m15t$spec_rdt)
+quantile(draws_m15t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m15t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m15t$average_sens_elisa)
+quantile(draws_m15t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m15t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m15t$spec_elisa)
+quantile(draws_m15t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m15t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m15t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m15t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m15t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 16t: Allow PCR and RDT to vary using cubic spline, nothing for ELISA, with time varying phi
+
+```{r m16t, echo=FALSE}
+
+stan_data_m16t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+spline_basis = spline_basis,
+indicat = indicat, 
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+# Compile the Stan model
+file_dat_m16t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m16_time.stan"))
+
+mod_dat_m16t <- stan_model(file_dat_m16t)
+
+fit_m16t <- sampling(mod_dat_m16t ,
+                data = stan_data_m16t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE)
+
+saveRDS(fit_m16t, file = "fit_m16t.rds")
+
+# Run LOO
+loo_m16t1 <- loo(fit_m16t, pars = "log_lik") 
+saveRDS(loo_m16t1, file = "loo_m16t1.rds")
+
+# Process draws
+draws_m16t <- as.data.frame(fit_m16t)
+draws_m16t <- process_draws_time(draws_m16t)
+
+# True infection probability
+mean(draws_m16t$average_phi)
+quantile(draws_m16t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m16t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m16t$average_sens_pcr)
+quantile(draws_m16t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m16t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m16t$spec_pcr)
+quantile(draws_m16t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m16t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m16t$average_sens_rdt)
+quantile(draws_m16t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m16t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m16t$spec_rdt)
+quantile(draws_m16t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m16t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m16t$average_sens_elisa)
+quantile(draws_m16t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m16t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m16t$spec_elisa)
+quantile(draws_m16t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m16t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m16t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m16t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m16t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 17: Cubic spline for PCR, linear for RDT, nothing for ELISA, with time varying phi
+
+```{r m17t, echo=FALSE}
+
+stan_data_m17t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+days_since_onset = days_since_onset,
+spline_basis = spline_basis,
+indicat = indicat,
+month1 = month1, 
+month2 = month2, 
+month3 = month3, 
+month4 = month4, 
+month5 = month5, 
+month6 = month6, 
+month7 = month7, 
+month8 = month8, 
+month9 = month9, 
+month10 = month10,
+prior_hev_missing=.2)
+
+# Compile the Stan model
+file_dat_m17t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m17_time.stan"))
+
+mod_dat_m17t <- stan_model(file_dat_m17t)
+
+fit_m17t <- sampling(mod_dat_m17t ,
+                data = stan_data_m17t,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE)
+
+saveRDS(fit_m17t, file = "fit_m17t.rds")
+
+# Run LOO
+loo_m17t1 <- loo(fit_m17t, pars = "log_lik") 
+saveRDS(loo_m17t1, file = "loo_m17t1.rds")
+
+# Process draws
+draws_m17t <- as.data.frame(fit_m17t)
+draws_m17t <- process_draws_time(draws_m17t)
+
+# True infection probability
+mean(draws_m17t$average_phi)
+quantile(draws_m17t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m17t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m17t$average_sens_pcr)
+quantile(draws_m17t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m17t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m17t$spec_pcr)
+quantile(draws_m17t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m17t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m17t$average_sens_rdt)
+quantile(draws_m17t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m17t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m17t$spec_rdt)
+quantile(draws_m17t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m17t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m17t$average_sens_elisa)
+quantile(draws_m17t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m17t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m17t$spec_elisa)
+quantile(draws_m17t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m17t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m17t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m17t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m17t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+Model 18: m1t but with age, with time varying phi
+
+```{r m18t}
+
+stan_data_m18t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+  days_since_onset = days_since_onset,
+  indicat = indicat,
+  month1 = month1, 
+  month2 = month2, 
+  month3 = month3, 
+  month4 = month4, 
+  month5 = month5, 
+  month6 = month6, 
+  month7 = month7, 
+  month8 = month8, 
+  month9 = month9, 
+  month10 = month10,
+  age_bin = age_bin,
+  prior_hev_missing=.2)
+
+file_dat_m18t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m18_time.stan"))
+
+mod_dat_m18t <- stan_model(file_dat_m18t)
+
+fit_m18t <- sampling(mod_dat_m18t,
+                    data = stan_data_m18t,
+                    iter = 2400,          # Total number of iterations (warmup + sampling)
+                    warmup = 1200,
+                    chains = 4,
+                    cores = 4,
+                    init_r = 0.1,
+                    # seed = 123,
+                    # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                    refresh = 100,
+                    save_warmup = TRUE
+) 
+
+saveRDS(fit_m18t, file = "fit_m18t.rds")
+
+# Run LOO
+loo_m18 <- loo(fit_m18t, pars = "log_lik")
+saveRDS(loo_m18, file = "loo_m18.rds")
+
+# Process draws
+draws_m18t <- as.data.frame(fit_m18t)
+
+draws_m18t <- process_draws_time(draws_m18t)
+
+# True infection probability
+mean(draws_m18t$average_phi)
+quantile(draws_m18t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m18t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m18t$average_sens_pcr)
+quantile(draws_m18t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m18t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m18t$spec_pcr)
+quantile(draws_m18t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m18t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m18t$average_sens_rdt)
+quantile(draws_m18t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m18t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m18t$spec_rdt)
+quantile(draws_m18t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m18t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m18t$average_sens_elisa)
+quantile(draws_m18t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m18t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m18t$spec_elisa)
+quantile(draws_m18t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m18t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# What about age coefficients?
+mean(inverse_logit_transform(draws_m18t$`age_coef_sens[1]`))
+quantile(inverse_logit_transform(draws_m18t$`age_coef_sens[1]`), c((1 - credible_level) / 2))
+quantile(inverse_logit_transform(draws_m18t$`age_coef_sens[1]`), c(1 - (1 - credible_level) / 2))
+
+mean(inverse_logit_transform(draws_m18t$`age_coef_sens[2]`))
+quantile(inverse_logit_transform(draws_m18t$`age_coef_sens[2]`), c((1 - credible_level) / 2))
+quantile(inverse_logit_transform(draws_m18t$`age_coef_sens[2]`), c(1 - (1 - credible_level) / 2))
+
+mean(inverse_logit_transform(draws_m18t$`age_coef_sens[3]`))
+quantile(inverse_logit_transform(draws_m18t$`age_coef_sens[3]`), c((1 - credible_level) / 2))
+quantile(inverse_logit_transform(draws_m18t$`age_coef_sens[3]`), c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m18t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m18t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m18t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Model 19: m1t but with age interaction, with time varying phi
+
+```{r m19t}
+
+stan_data_m19t <- list(
+  N = nrow(observed_results2),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos,
+  observed_results_array_pos = observed_results_array_pos,
+  observed_results_neg = observed_results_tests_neg,
+  observed_results_array_neg = observed_results_array_neg,
+  days_since_onset = days_since_onset,
+  indicat = indicat,
+  month1 = month1, 
+  month2 = month2, 
+  month3 = month3, 
+  month4 = month4, 
+  month5 = month5, 
+  month6 = month6, 
+  month7 = month7, 
+  month8 = month8, 
+  month9 = month9, 
+  month10 = month10,
+  age_bin = age_bin,
+  age_days = age_days,
+  prior_hev_missing=.2)
+
+file_dat_m19t <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m19_time.stan"))
+
+mod_dat_m19t <- stan_model(file_dat_m19t)
+
+fit_m19t <- sampling(mod_dat_m19t,
+                     data = stan_data_m19t,
+                     iter = 2400,          # Total number of iterations (warmup + sampling)
+                     warmup = 1200,
+                     chains = 4,
+                     cores = 4,
+                     init_r = 0.1,
+                     # seed = 123,
+                     # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                     refresh = 100,
+                     save_warmup = TRUE
+) 
+
+saveRDS(fit_m19t, file = "fit_m19t.rds")
+
+# Run LOO
+loo_m19 <- loo(fit_m19t, pars = "log_lik")
+saveRDS(loo_m19, file = "loo_m19.rds")
+
+# Process draws
+draws_m19t <- as.data.frame(fit_m19t)
+
+draws_m19t <- process_draws_time(draws_m19t)
+
+# True infection probability
+mean(draws_m19t$average_phi)
+quantile(draws_m19t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m19t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m19t$average_sens_pcr)
+quantile(draws_m19t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m19t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m19t$spec_pcr)
+quantile(draws_m19t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m19t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m19t$average_sens_rdt)
+quantile(draws_m19t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m19t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m19t$spec_rdt)
+quantile(draws_m19t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m19t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m19t$average_sens_elisa)
+quantile(draws_m19t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m19t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m19t$spec_elisa)
+quantile(draws_m19t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m19t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m19t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m19t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m19t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Now run leave one out cross validation to see which model performs best. What this means: https://users.aalto.fi/%7Eave/CV-FAQ.html#se_diff
+
+Note: If there is a warning about high pareto-K diagnostic values when implementing LOO, use the moment_match option
+
+```{r loo}
+
+loo_comparison <- loo_compare(loo_m0, loo_m0t1, loo_m1, loo_m1t1, loo_m2, loo_m2t, loo_m5a, loo_m5b, loo_m5bt1, loo_m5c, loo_m5ct1, loo_m5dt1, loo_m6, loo_m7, loo_m8, loo_m12, loo_m12t1, loo_m13, loo_m13t1, loo_m14, loo_m15t, loo_m16t1, loo_m17t1, loo_m18, loo_m19)
+
+print(loo_comparison)
+
+```
+
+
+SENSITIVITY ANALYSES
+FINAL SELECTED MODEL: m1t. Repeat this model with overall first symptom onset date instead of jaundice onset date. 
+
+```{r prep_dat3}
+
+observed_results3 <- observed_results2
+
+# Remove if missing days since symptom onset
+observed_results3 <- observed_results3 %>% filter(is.na(days_since_symp)==FALSE)
+
+# Global spline with no knots
+observed_results3 <- observed_results3 %>% mutate(days_since_symp_sp = poly(days_since_symp, degree = 3, raw = TRUE))
+
+# Create a person variable in the observed data. Will need this later when estimating posterior probability of infection by test result combination
+observed_results3 <- observed_results3 %>% mutate(person=row_number())
+
+# Extract the spline basis
+spline_basis_symp <- as.matrix(observed_results3$days_since_symp_sp)
+
+# Create covariates
+days_since_onset_symp <- observed_results3 %>% select(days_since_symp)
+
+# Using month of symptom onset 
+month1_symp <- observed_results3 %>% select(month1_symp)
+month2_symp <- observed_results3 %>% select(month2_symp)
+month3_symp <- observed_results3 %>% select(month3_symp)
+month4_symp <- observed_results3 %>% select(month4_symp)
+month5_symp <- observed_results3 %>% select(month5_symp)
+month6_symp <- observed_results3 %>% select(month6_symp)
+month7_symp <- observed_results3 %>% select(month7_symp)
+month8_symp <- observed_results3 %>% select(month8_symp)
+month9_symp <- observed_results3 %>% select(month9_symp)
+month10_symp <- observed_results3 %>% select(month10_symp)
+
+indicat_symp <- as.integer(observed_results3$indicat)
+
+# Create an array manually. 
+
+# All positive RDT
+temp_pos <- array(0, dim = c(1243, 8))
+temp_pos <- as.data.frame(observed_results3$case_type_gran_pos)
+temp_pos <- temp_pos %>% dplyr::rename(classified_result=`observed_results3$case_type_gran_pos`)
+temp_pos <- temp_pos %>% mutate(V1=ifelse(classified_result=="PCR-,RDT-,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V2=ifelse(classified_result=="PCR-,RDT-,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V3=ifelse(classified_result=="PCR-,RDT+,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V4=ifelse(classified_result=="PCR-,RDT+,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V5=ifelse(classified_result=="PCR+,RDT-,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V6=ifelse(classified_result=="PCR+,RDT-,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V7=ifelse(classified_result=="PCR+,RDT+,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V8=ifelse(classified_result=="PCR+,RDT+,ELISA+",1,0))
+
+temp_pos <- temp_pos %>% select(-classified_result)
+observed_results_array_pos_symp <- array(unlist(temp_pos), dim = dim(temp_pos))
+observed_results_tests_pos_symp <- observed_results3 %>% select(baseline_pcr_result, case_hevrdt_pos, baseline_igm_result)
+
+# All negative RDT
+temp_neg <- array(0, dim = c(1243, 8))
+temp_neg <- as.data.frame(observed_results3$case_type_gran_neg)
+temp_neg <- temp_neg %>% dplyr::rename(classified_result=`observed_results3$case_type_gran_neg`)
+temp_neg <- temp_neg %>% mutate(V1=ifelse(classified_result=="PCR-,RDT-,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V2=ifelse(classified_result=="PCR-,RDT-,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V3=ifelse(classified_result=="PCR-,RDT+,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V4=ifelse(classified_result=="PCR-,RDT+,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V5=ifelse(classified_result=="PCR+,RDT-,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V6=ifelse(classified_result=="PCR+,RDT-,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V7=ifelse(classified_result=="PCR+,RDT+,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V8=ifelse(classified_result=="PCR+,RDT+,ELISA+",1,0))
+
+temp_neg <- temp_neg %>% select(-classified_result)
+observed_results_array_neg_symp <- array(unlist(temp_neg), dim = dim(temp_neg))
+
+observed_results_tests_neg_symp <- observed_results3 %>% select(baseline_pcr_result, case_hevrdt_neg, baseline_igm_result)
+
+```
+
+Run m1t using the symptom data:
+
+```{r sens_m1ts}
+
+stan_data_m1ts <- list(
+  N = nrow(observed_results3),
+  N_obs = 8,
+  observed_results_pos = observed_results_tests_pos_symp,
+  observed_results_array_pos = observed_results_array_pos_symp,
+  observed_results_neg = observed_results_tests_neg_symp,
+  observed_results_array_neg = observed_results_array_neg_symp,
+days_since_onset = days_since_onset_symp,
+indicat = indicat_symp,
+month1 = month1_symp, 
+month2 = month2_symp, 
+month3 = month3_symp, 
+month4 = month4_symp, 
+month5 = month5_symp, 
+month6 = month6_symp, 
+month7 = month7_symp, 
+month8 = month8_symp, 
+month9 = month9_symp, 
+month10 = month10_symp,
+prior_hev_missing=.2)
+
+file_dat_m1ts <- file.path(here("scripts/Diagnostics/Latent_class_multinomial_m1_time.stan"))
+
+mod_dat_m1_ts <- stan_model(file_dat_m1ts)
+
+fit_m1ts <- sampling(mod_dat_m1_ts,
+                data = stan_data_m1ts,
+                iter = 2400,          # Total number of iterations (warmup + sampling)
+                warmup = 1200,
+                chains = 4,
+                cores = 4,
+               init_r = 0.1,
+                # seed = 123,
+                # control = list(max_treedepth = 20, adapt_delta = 0.95),
+                refresh = 100,
+                save_warmup = TRUE
+) 
+
+
+# Diagnostics 
+saveRDS(fit_m1ts, file = "fit_m1t_marg_symp.rds")
+
+draws_m1ts <- as.data.frame(fit_m1ts)
+
+draws_m1ts <- process_draws_time(draws_m1ts)
+
+# True infection probability
+mean(draws_m1ts$average_phi)
+quantile(draws_m1ts$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m1ts$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m1ts$average_sens_pcr)
+quantile(draws_m1ts$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1ts$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m1ts$spec_pcr)
+quantile(draws_m1ts$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1ts$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m1ts$average_sens_rdt)
+quantile(draws_m1ts$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1ts$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m1ts$spec_rdt)
+quantile(draws_m1ts$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1ts$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m1ts$average_sens_elisa)
+quantile(draws_m1ts$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1ts$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m1ts$spec_elisa)
+quantile(draws_m1ts$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1ts$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m1ts %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m1ts %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m1ts %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results3 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_symp<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_symp<=14)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+```

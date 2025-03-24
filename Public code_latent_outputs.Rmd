@@ -1,0 +1,2263 @@
+---
+title: "Public_latent_outputs"
+author: "Aybuke Koyuncu"
+date: "2025-03-21"
+output: html_document
+---
+
+FINAL SELECTED MODEL: m1t. All final outputs in the main text should be based on this model
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Loading packages 
+library(here)
+library(gtsummary)
+library(knitr)
+library(cowplot)
+library(ggridges)
+library(stringr)
+library(splines)
+library(splines2)
+library(bayesplot)
+library(cmdstanr)
+library(rstan)
+library(shinystan)
+library(icenReg)
+library(dplyr)
+library(epiR)
+library(janitor)
+library(readr)
+library(lubridate)
+library(reshape2)
+library(ggplot2)
+library(tidyr)
+
+# # Create functions to transform data so sens/spec stay within 0 to 1 bounds
+logit_transform <- function(p) {
+  log(p / (1 - p))
+}
+
+inverse_logit_transform <- function(x) {
+  exp(x) / (1 + exp(x))
+}
+
+credible_level <- 0.95
+
+cases_table1  <- read_csv(here("scripts/Diagnostics/For Git/dat_minimal.csv"))
+
+```
+
+
+```{r func}
+
+# Define a function to automate the process
+process_draws <- function(draws) {
+  
+  # Add ID
+  draws <- draws %>% mutate(id=row_number())
+  
+  # Step 2: Isolate sensitivity data for each test (PCR, RDT, ELISA)
+sens_pcr <- draws %>% 
+  select(matches("sens_all\\[\\d+,1\\]"))
+
+sens_rdt <- draws %>% 
+  select(matches("sens_all\\[\\d+,2\\]"))
+
+sens_elisa <- draws %>% 
+  select(matches("sens_all\\[\\d+,3\\]"))
+  
+  # Step 3: Isolate specificity data for each test (PCR, RDT, ELISA)
+draws$spec_pcr <- (draws$`spec_all[1]`)
+draws$spec_rdt <- (draws$`spec_all[2]`)
+draws$spec_elisa <- (draws$`spec_all[3]`)
+  
+# Add average ACROSS individuals
+draws$average_sens_pcr <- rowMeans(sens_pcr, na.rm = TRUE)
+draws$average_sens_rdt <- rowMeans(sens_rdt, na.rm = TRUE)
+draws$average_sens_elisa <- rowMeans(sens_elisa, na.rm = TRUE)
+
+  return(draws)
+}
+
+# Create a function for the models that also allow phi to vary by time 
+process_draws_time <- function(draws) {
+  
+  # Add ID
+  draws <- draws %>% mutate(id=row_number())
+
+  #  Isolate sensitivity data for each test (PCR, RDT, ELISA)
+sens_pcr <- draws %>% 
+  select(matches("sens_all\\[\\d+,1\\]"))
+
+sens_rdt <- draws %>% 
+  select(matches("sens_all\\[\\d+,2\\]"))
+
+sens_elisa <- draws %>% 
+  select(matches("sens_all\\[\\d+,3\\]"))
+  
+  # Step 3: Isolate specificity data for each test (PCR, RDT, ELISA)
+draws$spec_pcr <- (draws$`spec_all[1]`)
+draws$spec_rdt <- (draws$`spec_all[2]`)
+draws$spec_elisa <- (draws$`spec_all[3]`)
+  
+# Step 4: Isole phi data
+phi <- draws %>%
+  select(starts_with("phi[")) 
+
+# Add average ACROSS individuals
+draws$average_sens_pcr <- rowMeans(sens_pcr, na.rm = TRUE)
+draws$average_sens_rdt <- rowMeans(sens_rdt, na.rm = TRUE)
+draws$average_sens_elisa <- rowMeans(sens_elisa, na.rm = TRUE)
+draws$average_phi <- rowMeans(phi, na.rm = TRUE)
+  
+  return(draws)
+}
+
+options(mc.cores=parallel::detectCores())
+
+```
+
+Table 1: pan-positive, mixed, and pan-negative. Full table with case_type_gran will go in supplement. 
+
+```{r table1}
+
+# Case type
+tabyl(cases_table1$case_type_gran)
+tabyl(cases_table1$case_type3)
+
+# Sex 
+tabyl(cases_table1$id_sex)
+
+tabyl(cases_table1, case_type_gran, id_sex)
+tabyl(cases_table1, case_type_gran, id_sex) %>% adorn_percentages("row")
+
+tabyl(cases_table1, case_type3, id_sex)
+tabyl(cases_table1, case_type3, id_sex) %>% adorn_percentages("row")
+
+# Age
+summary(cases_table1$age)
+cases_table1 %>%
+  group_by(case_type_gran) %>%
+  summarize(
+    med = median(age),
+    Q1 = quantile(age, 0.25),
+    Q3 = quantile(age, 0.75))
+
+cases_table1 %>%
+  group_by(case_type3) %>%
+  summarize(
+    med = median(age),
+    Q1 = quantile(age, 0.25),
+    Q3 = quantile(age, 0.75))
+
+# Combine 6-10 and 11-15 categories
+cases_table1 <- cases_table1 %>% mutate(age_bin = case_when(
+  age_group_simple=="6-10" | age_group_simple=="11-15" ~ "6-15",
+TRUE ~ age_group_simple))
+
+tabyl(cases_table1$age_bin)
+tabyl(cases_table1, age_bin, case_type_gran)
+tabyl(cases_table1, age_bin, case_type_gran) %>% adorn_percentages("col")
+
+tabyl(cases_table1, age_bin, case_type3)
+tabyl(cases_table1, age_bin, case_type3) %>% adorn_percentages("col")
+
+# Days since jaundice onset
+summary(cases_table1$days_since_ajs_baseline)
+cases_table1 %>%
+  group_by(case_type_gran) %>%
+  summarize(
+    med = median(days_since_ajs_baseline, na.rm=TRUE),
+    Q1 = quantile(days_since_ajs_baseline, 0.25, na.rm=TRUE),
+    Q3 = quantile(days_since_ajs_baseline, 0.75, na.rm=TRUE))
+
+cases_table1 %>%
+  group_by(case_type3) %>%
+  summarize(
+    med = median(days_since_ajs_baseline, na.rm=TRUE),
+    Q1 = quantile(days_since_ajs_baseline, 0.25, na.rm=TRUE),
+    Q3 = quantile(days_since_ajs_baseline, 0.75, na.rm=TRUE))
+
+# Comment from Iza: also show 2 weeks. Need to create a new variable
+
+cases_table1 <- cases_table1 %>% mutate(days_since_ajs_bin2 = case_when(
+  days_since_ajs_baseline<=7 ~ "≤ 1 week",
+  days_since_ajs_baseline>7 & days_since_ajs_baseline<=14 ~ ">1 week to 2 weeks",
+  days_since_ajs_baseline>14 & days_since_ajs_baseline<=30 ~ ">2 weeks to 1 month",
+  days_since_ajs_baseline>30 & days_since_ajs_baseline<=60 ~ ">1 month to 2 months",
+  days_since_ajs_baseline>60 & is.na(days_since_ajs_baseline)==FALSE ~ ">2 months",
+TRUE ~ NA_character_
+))
+
+tabyl(cases_table1$days_since_ajs_bin2)
+tabyl(cases_table1, days_since_ajs_bin2, case_type3)
+cases_table1 %>% filter(is.na(days_since_ajs_bin2)==FALSE) %>% tabyl(days_since_ajs_bin2, case_type3) %>% adorn_percentages("col")
+
+tabyl(cases_table1, days_since_ajs_bin2, case_type_gran)
+cases_table1 %>% filter(is.na(days_since_ajs_bin2)==FALSE) %>% tabyl(days_since_ajs_bin2, case_type_gran) %>% adorn_percentages("col")
+
+# Baseline IgG results
+tabyl(cases_table1$baseline_igg_result)
+tabyl(cases_table1, baseline_igg_result, case_type_gran)
+tabyl(cases_table1, baseline_igg_result, case_type_gran) %>% adorn_percentages("col")
+
+tabyl(cases_table1, baseline_igg_result, case_type3)
+tabyl(cases_table1, baseline_igg_result, case_type3) %>% adorn_percentages("col")
+
+# ALT
+tabyl(cases_table1$alt_class)
+cases_table1 %>% filter(is.na(alt_class)==FALSE) %>% tabyl(alt_class, case_type_gran)
+cases_table1 %>% filter(is.na(alt_class)==FALSE) %>% tabyl(alt_class, case_type_gran) %>% adorn_percentages("col")
+
+cases_table1 %>% filter(is.na(alt_class)==FALSE) %>% tabyl(alt_class, case_type3)
+cases_table1 %>% filter(is.na(alt_class)==FALSE) %>% tabyl(alt_class, case_type3) %>% adorn_percentages("col")
+
+# AST
+tabyl(cases_table1$ast_class)
+cases_table1 %>% filter(is.na(ast_class)==FALSE) %>% tabyl(ast_class, case_type_gran)
+cases_table1 %>% filter(is.na(ast_class)==FALSE) %>% tabyl(ast_class, case_type_gran) %>% adorn_percentages("col")
+
+cases_table1 %>% filter(is.na(ast_class)==FALSE) %>% tabyl(ast_class, case_type3)
+cases_table1 %>% filter(is.na(ast_class)==FALSE) %>% tabyl(ast_class, case_type3) %>% adorn_percentages("col")
+
+# Deaths
+# Important note: outcomes are only available for those who were admitted
+# Create a new variable
+cases_table1 <- cases_table1 %>% mutate(deaths = case_when(
+case_outcome==3 ~ 1,
+TRUE ~ 0))
+
+tabyl(cases_table1$deaths)
+tabyl(cases_table1, deaths, case_type_gran)
+tabyl(cases_table1, deaths, case_type_gran) %>% adorn_percentages("col")
+
+tabyl(cases_table1, deaths, case_type3)
+tabyl(cases_table1, deaths, case_type3) %>% adorn_percentages("col")
+
+# Explore if there are differences in days since jaundice onset by age
+cases_table1 %>% group_by(age_group_simple) %>% summarize(avg_days_since_ajs_baseline = mean(days_since_ajs_baseline, na.rm = TRUE))
+
+cases_table1 <- cases_table1 %>% mutate(age_binary = ifelse(age<=16,0,1))
+
+t.test(days_since_ajs_baseline~age_binary, data=cases_table1)
+
+# No differences by sex
+t.test(days_since_ajs_baseline~id_sex, data=cases_table1)
+
+# Hospitalizations
+tabyl(cases_table1$case_admit)
+tabyl(cases_table1, case_admit, case_type3)
+cases_table1 %>% filter(is.na(case_admit)==FALSE) %>% tabyl(case_admit, case_type3) %>% adorn_percentages("col")
+
+tabyl(cases_table1, case_admit, case_type_gran)
+cases_table1 %>% filter(is.na(case_admit)==FALSE) %>% tabyl(case_admit, case_type_gran) %>% adorn_percentages("col")
+
+# Among hospitalized, what was time since jaundice onset
+cases_table1 %>% filter(case_admit==1) %>% tabyl(days_since_ajs_bin2)
+
+# Deaths
+tabyl(cases_table1$case_outcome) #1 = discharged, 2 = left against medical advice, 3 = died
+tabyl(cases_table1, case_outcome, case_type3)
+
+# Who had a baseline visit 
+tabyl(cases_table1$fup_bin)
+tabyl(cases_table1, fup_bin, case_type3)
+cases_table1 %>% tabyl(fup_bin, case_type3) %>% adorn_percentages("col")
+
+# Test results
+tabyl(cases_table1$baseline_pcr_result)
+tabyl(cases_table1$baseline_igm_result)
+tabyl(cases_table1$case_hevrdt)
+
+# Pregnancy
+tabyl(cases_table1$id_preg)
+cases_table1 %>% filter(id_preg=="Yes") %>% tabyl(case_type_gran)
+
+# Who was positive for each test at baseline
+tabyl(cases_table1$baseline_pcr_result)
+tabyl(cases_table1$case_hevrdt)
+tabyl(cases_table1$baseline_igm_result)
+
+```
+
+```{r 2x2}
+# unadjusted 2x2 analysis of sens/spec compared to PCR
+
+# remove participants with more than 365 days since jaundice onset or missing jaundice onset
+cases_table12 <- cases_table1 %>% filter(days_since_ajs_baseline<=365)
+
+# Create a new variable for PCR OR ELISA positive
+cases_table12 <- cases_table12 %>% mutate(pcr_or_elisa = case_when(
+  baseline_pcr_result==1 | baseline_igm_result==1 ~ 1,
+  baseline_pcr_result==0 & baseline_igm_result==0 ~ 0,
+  TRUE ~ NA)) 
+
+# Create a new variable for PCR AND ELISA positive
+cases_table12 <- cases_table12 %>% mutate(pcr_and_elisa = case_when(
+  baseline_pcr_result==1 & baseline_igm_result==1 ~ 1,
+  baseline_pcr_result==0 & baseline_igm_result==0 ~ 0,
+  TRUE ~ NA)) 
+
+## RDT vs PCR gold standard
+tabyl(cases_table12, case_hevrdt, baseline_pcr_result)
+
+# Calculate Sensitivity and Specificity without package to double check
+ sens_rdt1 <- 170 / (10+170)
+ spec_rdt1 <- 637 / (637+75)
+
+# Calculate Confidence Intervals 
+sens_rdt1_ci <- binom.test(170, 10 + 170, conf.level = 0.95)$conf.int
+spec_rdt1_ci <- binom.test(637, 637+75, conf.level = 0.95)$conf.int
+
+# RDT vs ELISA gold standard
+tabyl(cases_table12, case_hevrdt, baseline_igm_result)
+
+# Calculate Sensitivity and Specificity without package to double check
+sens_rdt2 <- 208 / (208+28)
+spec_rdt2 <- 619 / (619+37)
+
+# Calculate Confidence Intervals 
+sens_rdt2_ci <- binom.test(208, 208+28, conf.level = 0.95)$conf.int
+spec_rdt2_ci <- binom.test(619, 619+37, conf.level = 0.95)$conf.int
+
+## ELISA vs PCR gold standard
+tabyl(cases_table12, baseline_igm_result, baseline_pcr_result)
+
+# Calculate Sensitivity and Specificity without package to double check
+sens_elisa1 <- 176 / (176+4)
+spec_elisa1 <- 652 / (652+60)
+
+# Calculate Confidence Intervals 
+sens_elisa1_ci <- binom.test(176, 176 + 4, conf.level = 0.95)$conf.int
+spec_elisa1_ci <- binom.test(652, 652 + 60, conf.level = 0.95)$conf.int
+
+## RDT vs PCR OR ELISA gold standard
+tabyl(cases_table12, case_hevrdt, pcr_or_elisa)
+
+# Calculate Sensitivity and Specificity without package to double check
+ sens_rdt3 <- 209 / (209 + 31)
+ spec_rdt3 <- 616 / (616 + 36)
+
+# Calculate Confidence Intervals 
+sens_rdt3_ci <- binom.test(209, 209 + 31, conf.level = 0.95)$conf.int
+spec_rdt3_ci <- binom.test(616, 616 + 36, conf.level = 0.95)$conf.int
+
+## RDT vs PCR AND ELISA gold standard. Has some NA values bc/s the OR cases are excluded
+tabyl(cases_table12, case_hevrdt, pcr_and_elisa)
+
+# Calculate Sensitivity and Specificity without package to double check
+ sens_rdt4 <- 169 / (169+7)
+ spec_rdt4 <- 616 / (616+36)
+
+# Calculate Confidence Intervals 
+sens_rdt4_ci <- binom.test(169, 169+7, conf.level = 0.95)$conf.int
+spec_rdt4_ci <- binom.test(616, 616+36, conf.level = 0.95)$conf.int
+
+```
+
+
+```{r add fup}
+
+lab_fup_data <- cases_table1 %>% filter(fup_bin==1)
+
+# Take only the fup results and fup days since jaundice onset. 
+lab_fup_data <- lab_fup_data %>% mutate(days_since_ajs=days_since_ajs_fup)
+lab_fup_data <- lab_fup_data %>% mutate(days_since_symp=days_since_symp_fup)
+
+# Remove the baseline data 
+lab_fup_data <- lab_fup_data %>% select(-baseline_pcr_result, -baseline_igm_result)
+
+# Make the fup results seem like just another baseline obs
+lab_fup_data <- lab_fup_data %>% dplyr::rename(baseline_igm_result=fup_igm_result,
+                                         baseline_pcr_result=fup_pcr_result)
+
+# Remove those with indeterminate values
+lab_fup_data <- lab_fup_data %>% filter(baseline_igm_result!=2)
+
+lab_fup_data <- lab_fup_data %>% select(pat_id, baseline_pcr_result, baseline_igm_result, age, age_group_simple, id_sex, days_since_ajs, days_since_symp, month1, month2, month3, month4, month5, month6, month7, month8, month9, month10)
+
+lab_fup_data <- lab_fup_data %>%
+  mutate(
+    age_group_simple = as.factor(age_group_simple),
+    id_sex = as.factor(id_sex)
+  )
+
+# Make case_hevrdt negative to track which ones are fup visits that are missing RDT
+lab_fup_data <- lab_fup_data %>% mutate(case_hevrdt=-1)
+
+```
+
+```{r prep_dat2}
+
+# Prepare observed data: make it 0/1 for negative/positive
+observed_results2 <- cases_table1 %>% select(case_type_gran,  baseline_igm_result, baseline_pcr_result, case_hevrdt, age, age_group_simple, id_sex, days_since_ajs_baseline, days_since_symp_baseline, pat_id, month1, month2, month3, month4, month5, month6, month7, month8, month9, month10) 
+
+# Rename days since ajs and days since symptoms
+observed_results2 <- observed_results2 %>% dplyr::rename(days_since_ajs=days_since_ajs_baseline)
+
+observed_results2 <- observed_results2 %>% dplyr::rename(days_since_symp=days_since_symp_baseline)
+
+# Make RDT results numeric
+observed_results2 <- observed_results2 %>%
+  mutate(case_hevrdt = case_when(
+     case_hevrdt == "Negative" ~ "0",
+     case_hevrdt == "Positive" ~ "1",
+    TRUE ~ NA_character_
+  )) %>% mutate(case_hevrdt=as.numeric(case_hevrdt))
+
+# Merge in the fup lab visits
+observed_results2 <- observed_results2 %>% bind_rows(lab_fup_data)
+
+# Replace days since jaundice=0 with 0.5. Do the same for symptom onset
+observed_results2 <- observed_results2 %>% mutate(days_since_ajs=ifelse(days_since_ajs==0, 0.5, days_since_ajs))
+
+observed_results2 <- observed_results2 %>% mutate(days_since_symp=ifelse(days_since_symp==0, 0.5, days_since_symp))
+
+# Remove if missing days since AJS
+observed_results2 <- observed_results2 %>% filter(is.na(days_since_ajs)==FALSE)
+
+# Global spline with no knots
+observed_results2 <- observed_results2 %>% mutate(days_since_ajs_sp = poly(days_since_ajs, degree = 3, raw = TRUE))
+
+# Create a person variable in the observed data. Will need this later when estimating posterior probability of infection by test result combination
+observed_results2 <- observed_results2 %>% mutate(person=row_number())
+
+# Make a variable for frequency of days since jaundice onset, will need this for rug plots later
+observed_results2 <- observed_results2 %>%
+  group_by(days_since_ajs) %>%
+  mutate(freq = n()) %>%
+  ungroup()
+
+# Extract the spline basis
+spline_basis <- as.matrix(observed_results2$days_since_ajs_sp)
+
+# Create covariates
+days_since_onset <- observed_results2 %>% select(days_since_ajs)
+
+# USING MONTH OF AJS ONSET INSTEAD OF CLINIC VISIT
+month1 <- observed_results2 %>% select(month1)
+month2 <- observed_results2 %>% select(month2)
+month3 <- observed_results2 %>% select(month3)
+month4 <- observed_results2 %>% select(month4)
+month5 <- observed_results2 %>% select(month5)
+month6 <- observed_results2 %>% select(month6)
+month7 <- observed_results2 %>% select(month7)
+month8 <- observed_results2 %>% select(month8)
+month9 <- observed_results2 %>% select(month9)
+month10 <- observed_results2 %>% select(month10)
+
+# Create an indicator variable for whether RDT results are real or fake
+observed_results2 <- observed_results2 %>% mutate(indicat=ifelse(case_hevrdt==-1,1,0))
+
+# If indicat is 0, it will undergo the normal likelihood calculation. If indicat is 1, it will process the fake results
+observed_results2 <- observed_results2 %>% mutate(case_hevrdt_pos=ifelse(indicat==0,case_hevrdt,1))
+observed_results2 <- observed_results2 %>% mutate(case_hevrdt_neg=ifelse(indicat==0,case_hevrdt,0))
+
+# Replace -1 values as missing
+observed_results2 <- observed_results2 %>% mutate(case_hevrdt=ifelse(case_hevrdt==-1,NA,case_hevrdt))
+
+indicat <- as.integer(observed_results2$indicat)
+
+```
+
+```{r complete}
+
+# For complete obs
+observed_results2 <- observed_results2 %>% mutate(case_type_gran = case_when(
+  baseline_pcr_result==0 & case_hevrdt==0 & baseline_igm_result ==0 ~ "PCR-,RDT-,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt==0 & baseline_igm_result ==1 ~ "PCR-,RDT-,ELISA+",
+  baseline_pcr_result==0 & case_hevrdt==1 & baseline_igm_result ==0 ~ "PCR-,RDT+,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt==1 & baseline_igm_result ==1 ~ "PCR-,RDT+,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt==0 & baseline_igm_result ==0 ~ "PCR+,RDT-,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt==0 & baseline_igm_result ==1 ~ "PCR+,RDT-,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt==1 & baseline_igm_result ==0 ~ "PCR+,RDT+,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt==1 & baseline_igm_result ==1 ~ "PCR+,RDT+,ELISA+",
+  TRUE ~ NA_character_)) %>% mutate(case_type_gran=factor(case_type_gran, levels= c( "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+")))
+
+# For obs with positive fake RDT. FULL dataset, but assumed all missing RDT were positive
+observed_results2 <- observed_results2 %>% mutate(case_type_gran_pos = case_when(
+  baseline_pcr_result==0 & case_hevrdt_pos==0 & baseline_igm_result ==0 ~ "PCR-,RDT-,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_pos==0 & baseline_igm_result ==1 ~ "PCR-,RDT-,ELISA+",
+  baseline_pcr_result==0 & case_hevrdt_pos==1 & baseline_igm_result ==0 ~ "PCR-,RDT+,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_pos==1 & baseline_igm_result ==1 ~ "PCR-,RDT+,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_pos==0 & baseline_igm_result ==0 ~ "PCR+,RDT-,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_pos==0 & baseline_igm_result ==1 ~ "PCR+,RDT-,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_pos==1 & baseline_igm_result ==0 ~ "PCR+,RDT+,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_pos==1 & baseline_igm_result ==1 ~ "PCR+,RDT+,ELISA+",
+  TRUE ~ case_type_gran)) %>% mutate(case_type_gran_pos=factor(case_type_gran_pos, levels= c( "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+")))
+
+# For obs with negative fake RDT. FULL dataset, but assumed all missing RDT were negative
+observed_results2 <- observed_results2 %>% mutate(case_type_gran_neg = case_when(
+  baseline_pcr_result==0 & case_hevrdt_neg==0 & baseline_igm_result ==0 ~ "PCR-,RDT-,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_neg==0 & baseline_igm_result ==1 ~ "PCR-,RDT-,ELISA+",
+  baseline_pcr_result==0 & case_hevrdt_neg==1 & baseline_igm_result ==0 ~ "PCR-,RDT+,ELISA-",
+  baseline_pcr_result==0 & case_hevrdt_neg==1 & baseline_igm_result ==1 ~ "PCR-,RDT+,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_neg==0 & baseline_igm_result ==0 ~ "PCR+,RDT-,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_neg==0 & baseline_igm_result ==1 ~ "PCR+,RDT-,ELISA+",
+  baseline_pcr_result==1 & case_hevrdt_neg==1 & baseline_igm_result ==0 ~ "PCR+,RDT+,ELISA-",
+  baseline_pcr_result==1 & case_hevrdt_neg==1 & baseline_igm_result ==1 ~ "PCR+,RDT+,ELISA+",
+  TRUE ~ case_type_gran)) %>% mutate(case_type_gran_neg=factor(case_type_gran_neg, levels= c( "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+")))
+```
+
+Create the arrays:
+
+```{r array}
+
+# Create an array manually. 
+
+# All positive RDT
+temp_pos <- array(0, dim = c(1251, 8))
+temp_pos <- as.data.frame(observed_results2$case_type_gran_pos)
+temp_pos <- temp_pos %>% dplyr::rename(classified_result=`observed_results2$case_type_gran_pos`)
+temp_pos <- temp_pos %>% mutate(V1=ifelse(classified_result=="PCR-,RDT-,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V2=ifelse(classified_result=="PCR-,RDT-,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V3=ifelse(classified_result=="PCR-,RDT+,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V4=ifelse(classified_result=="PCR-,RDT+,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V5=ifelse(classified_result=="PCR+,RDT-,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V6=ifelse(classified_result=="PCR+,RDT-,ELISA+",1,0))
+temp_pos <- temp_pos %>% mutate(V7=ifelse(classified_result=="PCR+,RDT+,ELISA-",1,0))
+temp_pos <- temp_pos %>% mutate(V8=ifelse(classified_result=="PCR+,RDT+,ELISA+",1,0))
+
+temp_pos <- temp_pos %>% select(-classified_result)
+observed_results_array_pos <- array(unlist(temp_pos), dim = dim(temp_pos))
+observed_results_tests_pos <- observed_results2 %>% select(baseline_pcr_result, case_hevrdt_pos, baseline_igm_result)
+
+# All negative RDT
+temp_neg <- array(0, dim = c(1251, 8))
+temp_neg <- as.data.frame(observed_results2$case_type_gran_neg)
+temp_neg <- temp_neg %>% dplyr::rename(classified_result=`observed_results2$case_type_gran_neg`)
+temp_neg <- temp_neg %>% mutate(V1=ifelse(classified_result=="PCR-,RDT-,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V2=ifelse(classified_result=="PCR-,RDT-,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V3=ifelse(classified_result=="PCR-,RDT+,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V4=ifelse(classified_result=="PCR-,RDT+,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V5=ifelse(classified_result=="PCR+,RDT-,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V6=ifelse(classified_result=="PCR+,RDT-,ELISA+",1,0))
+temp_neg <- temp_neg %>% mutate(V7=ifelse(classified_result=="PCR+,RDT+,ELISA-",1,0))
+temp_neg <- temp_neg %>% mutate(V8=ifelse(classified_result=="PCR+,RDT+,ELISA+",1,0))
+
+temp_neg <- temp_neg %>% select(-classified_result)
+observed_results_array_neg <- array(unlist(temp_neg), dim = dim(temp_neg))
+
+observed_results_tests_neg <- observed_results2 %>% select(baseline_pcr_result, case_hevrdt_neg, baseline_igm_result)
+
+```
+
+```{r fig1}
+
+# Load final model
+fit_m1_t <- readRDS(here("scripts/Diagnostics/fit_m1t.rds"))
+
+draws_m1_t <- as.data.frame(fit_m1_t)
+draws_m1_t <- process_draws_time(draws_m1_t)
+
+# True infection probability
+mean(draws_m1_t$average_phi)
+quantile(draws_m1_t$average_phi, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_phi, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Sensitivity
+mean(draws_m1_t$average_sens_pcr)
+quantile(draws_m1_t$average_sens_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # PCR: Specificity
+mean(draws_m1_t$spec_pcr)
+quantile(draws_m1_t$spec_pcr, c((1 - credible_level) / 2))
+quantile(draws_m1_t$spec_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(draws_m1_t$average_sens_rdt)
+quantile(draws_m1_t$average_sens_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Specificity
+mean(draws_m1_t$spec_rdt)
+quantile(draws_m1_t$spec_rdt, c((1 - credible_level) / 2))
+quantile(draws_m1_t$spec_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(draws_m1_t$average_sens_elisa)
+quantile(draws_m1_t$average_sens_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1_t$average_sens_elisa, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Specificity
+mean(draws_m1_t$spec_elisa)
+quantile(draws_m1_t$spec_elisa, c((1 - credible_level) / 2))
+quantile(draws_m1_t$spec_elisa, c(1 - (1 - credible_level) / 2))
+
+# Look at curves
+
+num_draws <- 1000
+N <- nrow(observed_results2)  
+num_tests <- 3  
+max_days <- 365
+days_pred <- (0:365)
+
+# Extract posterior draws
+intercept_sens_m1t <- draws_m1_t %>%
+  select(starts_with("intercept_sens"))
+   
+onset_coefs_m1t <-  draws_m1_t %>%
+  select(starts_with("onset_coef_sens"))
+
+# Initialize pred_sens_draws_m2 array
+pred_sens_draws_m1t <- array(NA, dim = c(num_draws, max_days + 1, num_tests))
+
+# Loop through each draw and test combination
+for (draw in 1:num_draws) {
+  for (test in 1:num_tests) {
+
+  # Calculate predicted sensitivity using spline coefficients and intercept for all days at once
+    logit_sens_pred <- as.numeric(intercept_sens_m1t[draw, test]) +
+                       days_pred*as.numeric(onset_coefs_m1t[draw,test])
+
+    # Store predicted sensitivity after applying the inverse logit transform
+    pred_sens_draws_m1t[draw, , test] <- inverse_logit_transform(logit_sens_pred)
+  }
+}
+
+# Convert to a dataframe
+pred_sens_df_m1t <- melt(array(pred_sens_draws_m1t, dim = c(num_draws, max_days + 1, num_tests)),
+                        varnames = c("Draw", "Day", "Test"),
+                        value.name = "Sensitivity")
+
+
+pred_sens_df_m1t$Day <- pred_sens_df_m1t$Day - 1
+
+# Calculate quantiles for each day and test
+quantiles_df_m1t <- pred_sens_df_m1t %>%
+  group_by(Test, Day) %>%
+  summarize(
+    Median = median(Sensitivity),
+    Q2_5 = quantile(Sensitivity, 0.025),
+    Q20 = quantile(Sensitivity, 0.20),
+    Q80 = quantile(Sensitivity, 0.80),
+    Q97_5 = quantile(Sensitivity, 0.975)
+  ) %>%
+  ungroup()
+
+# Download color pallette 
+library(paletteer)
+
+# Plot 
+
+plot_pcr_m1t <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==1), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==1), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m1t %>% filter(Test==1), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "PCR Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  # Adding rug plot with alpha mapped to frequency
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1)) + xlim(0,300) + 
+  theme(legend.position="none") + geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  theme(legend.position="right", plot.title = element_text(size = 10)) +   geom_rect(aes(xmin = 0, xmax = 30, ymin = 0, ymax = 1), fill = NA, color = "black", linetype = "dashed", size = 0.2) + ggtitle("A")
+
+plot_pcr_m1t
+
+plot_rdt_m1t <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==2), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==2), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m1t %>% filter(Test==2), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "RDT Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  # Adding rug plot with alpha mapped to frequency
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1)) + xlim(0,300) + 
+  theme(legend.position="none") + geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  theme(legend.position="right", plot.title = element_text(size = 10)) + geom_rect(aes(xmin = 0, xmax = 30, ymin = 0, ymax = 1), fill = NA, color = "black", linetype = "dashed", size = 0.2) + ggtitle("C")
+
+
+plot_rdt_m1t
+
+plot_elisa_m1t <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==3), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==3), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m1t %>% filter(Test==3), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "ELISA Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1)  + geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  xlim(0,300) + 
+  theme(legend.position="right", plot.title = element_text(size = 10)) + geom_rect(aes(xmin = 0, xmax = 30, ymin = 0, ymax = 1), fill = NA, color = "black", linetype = "dashed", size = 0.2) + ggtitle("E")
+
+plot_elisa_m1t
+
+# Truncated at 30 days
+plot_pcr_m1t_30 <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==1), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==1), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m1t %>% filter(Test==1), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "PCR Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,30) + 
+  theme(legend.position="none", plot.title = element_text(size = 10)) + ggtitle("B")
+
+plot_pcr_m1t_30
+
+plot_rdt_m1t_30 <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==2), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==2), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m1t %>% filter(Test==2), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "RDT Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,30) + 
+  theme(legend.position="none", plot.title = element_text(size = 10)) + ggtitle("D")
+
+plot_rdt_m1t_30
+
+plot_elisa_m1t_30 <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==3), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m1t %>% filter(Test==3), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m1t %>% filter(Test==3), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "ELISA Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,30) + 
+  theme(legend.position="none", plot.title = element_text(size = 10)) + ggtitle("F")
+
+plot_elisa_m1t_30
+
+# Put it all together
+common_legend <- get_legend(plot_pcr_m1t + theme(legend.position = "right"))
+
+# Arrange plots without individual legends
+fig1 <- plot_grid(
+  plot_pcr_m1t + theme(legend.position = "none"),
+  plot_pcr_m1t_30 + theme(legend.position = "none"),
+  plot_rdt_m1t + theme(legend.position = "none"),
+  plot_rdt_m1t_30 + theme(legend.position = "none"),
+  plot_elisa_m1t + theme(legend.position = "none"),
+  plot_elisa_m1t_30 + theme(legend.position = "none"),
+  ncol = 2,
+  nrow = 3,
+  rel_widths = c(1, 1, 1)
+)
+
+# Add the common legend below
+fig1_final <- plot_grid(fig1, common_legend, ncol = 1, rel_heights = c(3, 0.4)) 
+# ggsave("fig1_final.pdf")
+
+# Get 2 week and 30 day averages for sensitivity 
+sens_pcr <- draws_m1_t %>%
+  select(matches("sens_all\\[\\d+,1\\]")) %>% mutate(draw=row_number())
+
+sens_rdt <- draws_m1_t %>%
+  select(matches("sens_all\\[\\d+,2\\]")) %>% mutate(draw=row_number())
+
+sens_elisa <- draws_m1_t %>%
+  select(matches("sens_all\\[\\d+,3\\]")) %>% mutate(draw=row_number())
+
+sens_pcr_long <- pivot_longer(
+  sens_pcr ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_pcr"  # Name of the new column that will hold the values
+)
+
+sens_rdt_long <- pivot_longer(
+  sens_rdt ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_rdt"  # Name of the new column that will hold the values
+)
+
+sens_elisa_long <- pivot_longer(
+  sens_elisa ,
+  cols = starts_with("sens_all"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "sens_elisa"  # Name of the new column that will hold the values
+)
+
+
+# Clean the 'person' column to extract just the number
+sens_pcr_long$person <- str_remove_all(sens_pcr_long$person, "sens_all\\[|\\]")
+sens_pcr_long$person <- sub(",.*", "", sens_pcr_long$person)
+
+sens_rdt_long$person <- str_remove_all(sens_rdt_long$person, "sens_all\\[|\\]")
+sens_rdt_long$person <- sub(",.*", "", sens_rdt_long$person)
+
+sens_elisa_long$person <- str_remove_all(sens_elisa_long$person, "sens_all\\[|\\]")
+sens_elisa_long$person <- sub(",.*", "", sens_elisa_long$person)
+
+# Convert 'person' column to numeric
+sens_pcr_long$person <- as.numeric(sens_pcr_long$person)
+sens_rdt_long$person <- as.numeric(sens_rdt_long$person)
+sens_elisa_long$person <- as.numeric(sens_elisa_long$person)
+
+# Put together all the sens  results
+sens_full <- full_join(sens_pcr_long, sens_rdt_long, by = c("person", "draw"))
+sens_full <- full_join(sens_full, sens_elisa_long)
+
+# Now merge
+sens_full <- left_join(sens_full, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+baseline_sens_30 <- sens_full %>% filter(days_since_ajs<=30)
+baseline_sens_14 <- sens_full %>% filter(days_since_ajs<=14)
+
+# Note: this still includes some follow-up visits
+tabyl(baseline_sens_30$indicat)
+
+# # PCR: Sensitivity
+mean(baseline_sens_14$sens_pcr)
+quantile(baseline_sens_14$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_pcr)
+quantile(baseline_sens_30$sens_pcr, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: Sensitivity
+mean(baseline_sens_14$sens_rdt)
+quantile(baseline_sens_14$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_rdt)
+quantile(baseline_sens_30$sens_rdt, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: Sensitivity
+mean(baseline_sens_14$sens_elisa)
+quantile(baseline_sens_14$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_14$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(baseline_sens_30$sens_elisa)
+quantile(baseline_sens_30$sens_elisa, c((1 - credible_level) / 2))
+quantile(baseline_sens_30$sens_elisa, c(1 - (1 - credible_level) / 2))
+
+```
+
+Make plots of priors vs posterior density plots
+
+```{r prior_posterior}
+
+#########
+# Phi
+#########
+post_phi <- as.data.frame(draws_m1_t$average_phi)
+colnames(post_phi) <- "phi"
+post_phi <- post_phi %>% mutate(type="posterior")
+
+prior_phi <- as.data.frame(rnorm(4000, mean=-1.386294, sd = 0.7))
+colnames(prior_phi) <- "logit_phi"
+prior_phi <- prior_phi %>% mutate(phi=inverse_logit_transform(logit_phi)) %>% select(phi)
+prior_phi <- prior_phi %>% mutate(type="prior")
+
+combined_phi <- bind_rows(post_phi, prior_phi)
+
+pri_post_phi <- ggplot(combined_phi, aes(x = phi, fill = type)) +
+  geom_density(alpha=0.8, color=NA) +
+  labs(title = "",
+       x = "Value",
+       y = "Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("posterior" = "darkred", "prior" = "grey"))  + ggtitle("C") + xlab("Probability of HEV infection") + theme(legend.position="none")
+
+pri_post_phi
+
+#Posterior probability of infection for each person
+
+# Load unadjusted model
+fit_m0 <- readRDS("~/Desktop/GitRepos/hev_bentiu/scripts/Diagnostics/fit_m0.rds")
+
+# Process draws
+draws <- as.data.frame(fit_m0)
+draws <- process_draws(draws)
+draws <- draws %>% mutate(id=row_number())
+
+# Take average across draws
+infect_prob0 <- draws %>%
+  select(starts_with("posterior_infection_prob")) 
+
+infect_prob0 <- infect_prob0 %>% mutate(draw=row_number())
+
+infect_prob_long0 <- pivot_longer(
+  infect_prob0,
+  cols = starts_with("posterior_infection_prob"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "infection_prob"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+infect_prob_long0$person <- str_remove_all(infect_prob_long0$person, "posterior_infection_prob\\[|\\]")
+
+# Convert 'person' column to numeric 
+infect_prob_long0$person <- as.numeric(infect_prob_long0$person)
+
+ # Now merge
+infect_prob_long0 <- left_join(infect_prob_long0, observed_results2 , by = "person")
+
+# Remove people missing RDT at follow-up
+infect_prob_long0 <- infect_prob_long0 %>% filter(is.na(case_type_gran)==FALSE)
+
+# Plot ridge plot
+ridge0 <- ggplot(infect_prob_long0, aes(x = infection_prob, y = case_type_gran, fill=case_type_gran)) +
+  geom_density_ridges(scale = 1.5, rel_min_height = 0.01, color=NA)  +
+    theme_ridges() +
+  labs(x = "Posterior Probability of HEV Infection", y = "Test Results") +
+  theme(
+    axis.title.x = element_text(size=10, hjust = 0.5),  # Center the x-axis label
+    axis.title.y = element_text(hjust = 0.5),
+     plot.title = element_text(hjust = 0, face = "plain")  # Ensure title is not bolded
+) +   # Center the y-axis label
+  ggtitle("A") + theme(legend.position = "none")
+
+# Final model
+# Take average across draws
+
+infect_prob1t <- draws_m1_t %>%
+  select(starts_with("posterior_infection_prob")) 
+
+infect_prob1t <- infect_prob1t %>% mutate(draw=row_number())
+
+infect_prob_long1t <- pivot_longer(
+  infect_prob1t ,
+  cols = starts_with("posterior_infection_prob"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "infection_prob"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+infect_prob_long1t$person <- str_remove_all(infect_prob_long1t$person, "posterior_infection_prob\\[|\\]")
+
+# Convert 'person' column to numeric 
+infect_prob_long1t$person <- as.numeric(infect_prob_long1t$person)
+
+ # Now merge
+infect_prob_long1t <- left_join(infect_prob_long1t, observed_results2 , by = "person")
+
+# Remove people missing RDT results at follow-up
+infect_prob_long1t <- infect_prob_long1t %>% filter(is.na(case_type_gran)==FALSE)
+
+# Plot ridge plot
+ridge1t <- ggplot(infect_prob_long1t, aes(x = infection_prob, y = case_type_gran, fill=case_type_gran)) +
+  geom_density_ridges(scale = 1.5, rel_min_height = 0.01, color=NA)  +
+    theme_ridges() +
+  labs(x = "Posterior Probability of HEV Infection", y = "Test Results") +
+  theme(
+    axis.title.x = element_text(size=10, hjust = 0.5),  # Center the x-axis label
+    axis.title.y = element_text(hjust = 0.5),
+     plot.title = element_text(hjust = 0, face = "plain")  # Ensure title is not bolded
+) +   # Center the y-axis label
+  ggtitle("B") + theme(legend.position = "none") 
+
+# Put it all together into one figure 
+supp_fig2 <- plot_grid(
+  ridge0, ridge1t, pri_post_phi,
+  rel_widths = c(1, 1, 0.5), # Adjust the relative widths to make first 2 have more room
+  ncol = 3)
+
+```
+
+Now look at PPV/NPV. Need to restrict to first 30 days similar to sensitivity estimates.
+
+```{r ppv_npv2}
+
+phi <-  draws_m1_t %>% select(starts_with("phi[")) %>% mutate(draw=row_number())
+
+phi_long <- pivot_longer(
+  phi,
+  cols = starts_with("phi"), # Specify columns to pivot
+  names_to = "person",    # Name of the new column that will hold the column names
+  values_to = "phi"  # Name of the new column that will hold the values
+)
+
+# Clean the 'person' column to extract just the number
+phi_long$person <- str_remove_all(phi_long$person, "phi\\[|\\]")
+phi_long$person <- sub(",.*", "", phi_long$person)
+
+# Convert 'person' column to numeric
+phi_long$person <- as.numeric(phi_long$person)
+
+# Put together all the results
+phi_full <- left_join(phi_long, observed_results2 , by = "person")
+
+# Remove obs that have more than 30 days since AJS onset
+phi_30 <- phi_full %>% filter(days_since_ajs<=30)
+phi_14 <- phi_full %>% filter(days_since_ajs<=14)
+
+
+# Combine dataframes for sens and phi
+
+full_dat <- full_join(phi_30, baseline_sens_30, by = c("person", "draw"))
+
+full_dat <- full_dat %>% select(draw, person, sens_pcr, sens_rdt, sens_elisa, phi)
+
+# Need to also extract and add specificity
+spec_full <- draws_m1_t %>% select("spec_all[1]", "spec_all[2]", "spec_all[3]") %>% mutate(draw=row_number())
+
+spec_full <- spec_full %>% dplyr::rename(spec_pcr="spec_all[1]",
+                                  spec_rdt="spec_all[2]",
+                                  spec_elisa="spec_all[3]")
+
+ # Now merge
+full_dat <- full_dat %>% left_join(spec_full, by = "draw")
+
+# Function for estimating ppv/npv
+estimate_ppv_npv <- function(sens, spec, prev) {
+  ppv <- (sens * prev) / ((sens * prev) + ((1 - spec) * (1 - prev)))
+  npv <- (spec * (1 - prev)) / ((spec * (1 - prev)) + ((1 - sens) * prev))
+  
+  return(data.frame(PPV = ppv, NPV = npv))
+}
+
+full_dat <- full_dat <- full_dat %>%
+  mutate(
+    ppv_pcr = estimate_ppv_npv(sens_pcr, spec_pcr, phi)$PPV,
+    npv_pcr = estimate_ppv_npv(sens_pcr, spec_pcr, phi)$NPV,
+    
+    ppv_rdt = estimate_ppv_npv(sens_rdt, spec_rdt, phi)$PPV,
+    npv_rdt = estimate_ppv_npv(sens_rdt, spec_rdt, phi)$NPV,
+    
+    ppv_elisa = estimate_ppv_npv(sens_elisa, spec_elisa, phi)$PPV,
+    npv_elisa = estimate_ppv_npv(sens_elisa, spec_elisa, phi)$NPV
+  )
+
+# # PCR: PPV/NPV for 30 days 
+mean(full_dat$ppv_pcr)
+quantile(full_dat$ppv_pcr, c((1 - credible_level) / 2))
+quantile(full_dat$ppv_pcr, c(1 - (1 - credible_level) / 2))
+
+mean(full_dat$npv_pcr)
+quantile(full_dat$npv_pcr, c((1 - credible_level) / 2))
+quantile(full_dat$npv_pcr, c(1 - (1 - credible_level) / 2))
+
+# # RDT: PPV/NPV for 30 days
+mean(full_dat$ppv_rdt)
+quantile(full_dat$ppv_rdt, c((1 - credible_level) / 2))
+quantile(full_dat$ppv_rdt, c(1 - (1 - credible_level) / 2))
+
+mean(full_dat$npv_rdt)
+quantile(full_dat$npv_rdt, c((1 - credible_level) / 2))
+quantile(full_dat$npv_rdt, c(1 - (1 - credible_level) / 2))
+
+# # ELISA: PPV/NPV for 30 days
+mean(full_dat$ppv_elisa)
+quantile(full_dat$ppv_elisa, c((1 - credible_level) / 2))
+quantile(full_dat$ppv_elisa, c(1 - (1 - credible_level) / 2))
+
+mean(full_dat$npv_elisa)
+quantile(full_dat$npv_elisa, c((1 - credible_level) / 2))
+quantile(full_dat$npv_elisa, c(1 - (1 - credible_level) / 2))
+```
+
+
+```{r ppv_npv_sims}
+
+############Predict sensitivity, PPV, and NPV using fixed values for days since jaundice onset############
+
+full_test <- draws_m1_t %>%
+  select(starts_with("intercept_sens"), starts_with("onset_coef_sens"), starts_with("logit_spec")) %>%
+  mutate(record = row_number())
+
+full_test <- full_test %>% mutate(
+   sens_pcr_short = inverse_logit_transform(`intercept_sens[1]` + `onset_coef_sens[1]`*0),
+   sens_pcr_bentiu = inverse_logit_transform(`intercept_sens[1]` + `onset_coef_sens[1]`*8),
+   sens_pcr_long = inverse_logit_transform(`intercept_sens[1]` + `onset_coef_sens[1]`*30),
+
+   sens_rdt_short = inverse_logit_transform(`intercept_sens[2]` + `onset_coef_sens[2]`*0),
+   sens_rdt_bentiu = inverse_logit_transform(`intercept_sens[2]` + `onset_coef_sens[2]`*8),
+   sens_rdt_long = inverse_logit_transform(`intercept_sens[2]` + `onset_coef_sens[2]`*30),
+
+   sens_elisa_short = inverse_logit_transform(`intercept_sens[3]` + `onset_coef_sens[3]`*0),
+   sens_elisa_bentiu = inverse_logit_transform(`intercept_sens[3]` + `onset_coef_sens[3]`*8),
+   sens_elisa_long = inverse_logit_transform(`intercept_sens[3]` + `onset_coef_sens[3]`*30),
+    spec_pcr = inverse_logit_transform(`logit_spec[1]`),
+    spec_rdt = inverse_logit_transform(`logit_spec[2]`),
+    spec_elisa = inverse_logit_transform(`logit_spec[3]`))
+
+# Make seperate columns for spec in each data type (long, short, bentiu) just for ease reformatting dataset
+full_test <- full_test %>% dplyr::rename(spec_pcr_bentiu=spec_pcr,
+                    spec_rdt_bentiu=spec_rdt,
+                    spec_elisa_bentiu=spec_elisa)
+
+full_test <- full_test %>% mutate(spec_pcr_long = spec_pcr_bentiu,
+                                  spec_pcr_short = spec_pcr_bentiu,
+                                  spec_rdt_long = spec_rdt_bentiu, 
+                                  spec_rdt_short = spec_rdt_bentiu,
+                                  spec_elisa_long = spec_elisa_bentiu, 
+                                  spec_elisa_short = spec_elisa_bentiu)
+
+# Define a function to calculate PPV and NPV
+calculate_ppv <- function(sens, spec, prev) {
+  # PPV and NPV calculations
+  ppv <- (sens * prev) / (sens * prev + (1 - spec) * (1 - prev))
+}
+
+calculate_npv <- function(sens, spec, prev) {
+  npv <- (spec * (1 - prev)) / (spec * (1 - prev) + (1 - sens) * prev)
+}
+
+# Define prevalence levels
+prevalence_levels <- c(0.05, 0.10, 0.25, 0.50)
+
+# Loop over each row and each prevalence level
+full_test <- full_test %>%
+  mutate(
+    # Calculate PPV and NPV for each test and prevalence level
+    ppv_pcr_long_0.05 = calculate_ppv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.05),
+    npv_pcr_long_0.05 = calculate_npv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.05),
+    ppv_pcr_short_0.05 = calculate_ppv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.05),
+    npv_pcr_short_0.05 = calculate_npv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.05),
+    ppv_pcr_bentiu_0.05 = calculate_ppv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.05),
+    npv_pcr_bentiu_0.05 = calculate_npv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.05),
+    
+    ppv_pcr_long_0.10 = calculate_ppv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.10),
+    npv_pcr_long_0.10 = calculate_npv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.10),
+    ppv_pcr_short_0.10 = calculate_ppv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.10),
+    npv_pcr_short_0.10 = calculate_npv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.10),
+    ppv_pcr_bentiu_0.10 = calculate_ppv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.10),
+    npv_pcr_bentiu_0.10 = calculate_npv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.10),
+    
+    ppv_pcr_long_0.25 = calculate_ppv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.25),
+    npv_pcr_long_0.25 = calculate_npv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.25),
+    ppv_pcr_short_0.25 = calculate_ppv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.25),
+    npv_pcr_short_0.25 = calculate_npv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.25),
+    ppv_pcr_bentiu_0.25 = calculate_ppv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.25),
+    npv_pcr_bentiu_0.25 = calculate_npv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.25),
+    
+    ppv_pcr_long_0.50 = calculate_ppv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.5),
+    npv_pcr_long_0.50 = calculate_npv(sens = sens_pcr_long, spec = spec_pcr_bentiu, prev = 0.5),
+    ppv_pcr_short_0.50 = calculate_ppv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.5),
+    npv_pcr_short_0.50 = calculate_npv(sens = sens_pcr_short, spec = spec_pcr_bentiu, prev = 0.5),
+    ppv_pcr_bentiu_0.50 = calculate_ppv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.5),
+    npv_pcr_bentiu_0.50 = calculate_npv(sens = sens_pcr_bentiu, spec = spec_pcr_bentiu, prev = 0.5),
+    
+    # Repeat for RDT
+    ppv_rdt_long_0.05 = calculate_ppv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.05),
+    npv_rdt_long_0.05 = calculate_npv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.05),
+    ppv_rdt_short_0.05 = calculate_ppv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.05),
+    npv_rdt_short_0.05 = calculate_npv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.05),
+    ppv_rdt_bentiu_0.05 = calculate_ppv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.05),
+    npv_rdt_bentiu_0.05 = calculate_npv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.05),
+    
+    ppv_rdt_long_0.10 = calculate_ppv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.1),
+    npv_rdt_long_0.10 = calculate_npv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.1),
+    ppv_rdt_short_0.10 = calculate_ppv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.1),
+    npv_rdt_short_0.10 = calculate_npv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.1),
+    ppv_rdt_bentiu_0.10 = calculate_ppv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.1),
+    npv_rdt_bentiu_0.10 = calculate_npv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.1),
+    
+    ppv_rdt_long_0.25 = calculate_ppv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.25),
+    npv_rdt_long_0.25 = calculate_npv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.25),
+    ppv_rdt_short_0.25 = calculate_ppv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.25),
+    npv_rdt_short_0.25 = calculate_npv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.25),
+    ppv_rdt_bentiu_0.25 = calculate_ppv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.25),
+    npv_rdt_bentiu_0.25 = calculate_npv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.25),
+    
+    ppv_rdt_long_0.50 = calculate_ppv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.5),
+    npv_rdt_long_0.50 = calculate_npv(sens = sens_rdt_long, spec = spec_rdt_bentiu, prev = 0.5),
+    ppv_rdt_short_0.50 = calculate_ppv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.5),
+    npv_rdt_short_0.50 = calculate_npv(sens = sens_rdt_short, spec = spec_rdt_bentiu, prev = 0.5),
+    ppv_rdt_bentiu_0.50 = calculate_ppv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.5),
+    npv_rdt_bentiu_0.50 = calculate_npv(sens = sens_rdt_bentiu, spec = spec_rdt_bentiu, prev = 0.5),
+    
+    # Repeat for ELISA
+    ppv_elisa_long_0.05 = calculate_ppv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.05),
+    npv_elisa_long_0.05 = calculate_npv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.05),
+    ppv_elisa_short_0.05 = calculate_ppv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.05),
+    npv_elisa_short_0.05 = calculate_npv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.05),
+    ppv_elisa_bentiu_0.05 = calculate_ppv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.05),
+    npv_elisa_bentiu_0.05 = calculate_npv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.05),
+
+    ppv_elisa_long_0.10 = calculate_ppv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.1),
+    npv_elisa_long_0.10 = calculate_npv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.1),
+    ppv_elisa_short_0.10 = calculate_ppv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.1),
+    npv_elisa_short_0.10 = calculate_npv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.1),
+    ppv_elisa_bentiu_0.10 = calculate_ppv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.1),
+    npv_elisa_bentiu_0.10 = calculate_npv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.1),
+    
+    ppv_elisa_long_0.25 = calculate_ppv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.25),
+    npv_elisa_long_0.25 = calculate_npv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.25),
+    ppv_elisa_short_0.25 = calculate_ppv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.25),
+    npv_elisa_short_0.25 = calculate_npv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.25),
+    ppv_elisa_bentiu_0.25 = calculate_ppv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.25),
+    npv_elisa_bentiu_0.25 = calculate_npv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.25),
+    
+    ppv_elisa_long_0.50 = calculate_ppv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.5),
+    npv_elisa_long_0.50 = calculate_npv(sens = sens_elisa_long, spec = spec_elisa_bentiu, prev = 0.5),
+    ppv_elisa_short_0.50 = calculate_ppv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.5),
+    npv_elisa_short_0.50 = calculate_npv(sens = sens_elisa_short, spec = spec_elisa_bentiu, prev = 0.5),
+    ppv_elisa_bentiu_0.50 = calculate_ppv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.5),
+    npv_elisa_bentiu_0.50 = calculate_npv(sens = sens_elisa_bentiu, spec = spec_elisa_bentiu, prev = 0.5)
+  )
+
+# Convert the dataset to long format and split by Test (PCR, RDT, ELISA)
+full_test_long <- full_test %>%
+  pivot_longer(cols = starts_with("sens") | starts_with("spec") | starts_with("ppv") | starts_with("npv"), 
+               names_to = c("TestType", "Test", "Condition", "Prevalence"),
+               names_pattern = "(.*)_(.*)_(.*)_(.*)",  # Split column names into TestType, Test, and 
+               values_to = "Value")  # Store values in the "Value" column
+
+full_test_long <- full_test_long %>% filter(is.na(Test)==FALSE)
+full_test_long <- full_test_long %>% mutate(Test = toupper(Test),
+                                            TestType = toupper(TestType))
+
+# Create a group variable for easier plotting
+full_test_long <- full_test_long %>%
+  mutate(
+    Group = factor(paste(Test, Prevalence, sep = " - "))) 
+
+
+full_test_long$Group <- factor(full_test_long$Group, levels = c("PCR - 0.05", "ELISA - 0.05", "RDT - 0.05", "PCR - 0.10", "ELISA - 0.10", "RDT - 0.10", "PCR - 0.25", "ELISA - 0.25", "RDT - 0.25", "PCR - 0.50", "ELISA - 0.50", "RDT - 0.50"))
+
+full_test_long$Test <- factor(full_test_long$Test, levels = c("PCR", "ELISA", "RDT"))
+full_test_long$Condition <- factor(full_test_long$Condition, levels = c("short", "bentiu", "long"))
+
+full_ppv_long <- full_test_long %>% filter(TestType=="PPV")
+full_npv_long <- full_test_long %>% filter(TestType=="NPV")
+
+# Create new label names for facets
+supp.labs <- c("Days between jaundice onset and clinic visit: 0", "Days between jaundice onset and clinic visit: 8", "Days between jaundice onset and clinic visit: 30")
+names(supp.labs) <- c("short", "bentiu", "long")
+
+# Create summary data
+summary_ppv_data <- full_ppv_long %>%
+  group_by(Condition, Prevalence, Test) %>%
+  summarize(
+    Median = median(Value, na.rm = TRUE),
+    Lower = quantile(Value, 0.20, na.rm = TRUE),
+    Upper = quantile(Value, 0.80, na.rm = TRUE)
+  )
+
+summary_npv_data <- full_npv_long %>%
+  group_by(Condition, Prevalence, Test) %>%
+  summarize(
+    Median = median(Value, na.rm = TRUE),
+    Lower = quantile(Value, 0.20, na.rm = TRUE),
+    Upper = quantile(Value, 0.80, na.rm = TRUE)
+  )
+
+# Create the boxplot
+ppv_plot <- ggplot(summary_ppv_data, aes(x = Prevalence, y = Median, color = Test)) +
+geom_point(size = 1, position = position_dodge(width = 0.5)) +  # Dots at median
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0, position = position_dodge(width = 0.5)) + 
+  facet_wrap(~Condition, ncol = 1, labeller = labeller(Condition = supp.labs)) +
+  labs(
+    x = "Prevalence",
+    y = "Positive Predictive Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            strip.text = element_text(size = 6)) +
+  scale_color_manual(
+    values = c("PCR" = "skyblue", "RDT" = "orange", "ELISA" = "purple")  
+  ) 
+
+npv_plot <- ggplot(summary_npv_data, aes(x = Prevalence, y = Median, color = Test)) +
+geom_point(size = 1, position = position_dodge(width = 0.5)) +  # Dots at median
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0, position = position_dodge(width = 0.5)) + 
+  facet_wrap(~Condition, ncol = 1, labeller = labeller(Condition = supp.labs)) +
+  labs(
+    x = "Prevalence",
+    y = "Negative Predictive Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            strip.text = element_text(size = 6)) +
+  scale_color_manual(
+    values = c("PCR" = "skyblue", "RDT" = "orange", "ELISA" = "purple")  
+  )
+
+
+library(patchwork) # Using patchwork bc/s it allows a common legend
+fig_ppv_npv <- ppv_plot + npv_plot + 
+  plot_layout(ncol = 2, guides = "collect") & 
+  theme(legend.position = "bottom") # Position the legend at the bottom
+
+ggsave("fig_ppv_npv.pdf")
+
+```
+
+Retrodictive check on latent class model only:
+
+```{r latent}
+
+draws_m1_t <- draws_m1_t %>% mutate(draw=row_number())
+
+# Reduce to 100 draws per person, otherwise vector memory gets exhausted
+draws_m1_t <- draws_m1_t %>% filter(draw<=100)
+
+# Function to sample class based on probabilities
+sample_class <- function(prob_row) {
+  sample(1:8, size = 1, prob = prob_row)
+}
+
+p_data <- draws_m1_t %>%
+  select(starts_with("p["))
+
+# Step 1: Pivot longer to get person and class as variables
+df_long <- p_data %>%
+  pivot_longer(
+    cols = everything(),  # All columns are probabilities
+    names_to = "person_class",
+    values_to = "probability"
+  )
+
+# Step 2: Separate the person and class information
+df_long <- df_long %>%
+  mutate(
+    person = as.numeric(sub("p\\[([0-9]+),[0-9]+\\]", "\\1", person_class)),
+    class = as.numeric(sub("p\\[[0-9]+,([0-9]+)\\]", "\\1", person_class))
+  ) %>%
+  select(-person_class)  # Drop the original column names
+
+df_long <- df_long %>%
+  group_by(person, class) %>%
+  mutate(draw_id = row_number()) %>%
+  ungroup()
+
+ # Now merge
+df_long <- left_join(df_long, observed_results2 , by = "person")
+
+# Step 3: Pivot wider to make classes into columns
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from = class,
+    values_from = probability,
+    names_prefix = "class_"
+  )
+
+# Sample class based on probabilities
+df_wide <- df_wide %>% rowwise() %>% mutate(sampled_class = sample_class(c_across(starts_with("class_"))))
+
+# Create categories for days since ajs
+df_wide <- df_wide %>% mutate(ajs_bin = case_when(
+  days_since_ajs<=7 ~ "Early",
+  days_since_ajs>7 & days_since_ajs<=21 ~ "Medium",
+  days_since_ajs>21  ~ "Long",
+TRUE ~ NA_character_))
+
+observed_results2 <- observed_results2 %>% mutate(ajs_bin = case_when(
+  days_since_ajs<=7 ~ "Early",
+  days_since_ajs>7 & days_since_ajs<=21 ~ "Medium",
+  days_since_ajs>21  ~ "Long",
+TRUE ~ NA_character_))
+
+early <- df_wide %>% filter(ajs_bin=="Early")
+med <- df_wide %>% filter(ajs_bin=="Medium")
+long <- df_wide %>% filter(ajs_bin=="Long")
+
+# Group by draw_id and estimate the proportion of each class 
+early <- early %>%
+  group_by(draw_id) %>%
+  summarise(
+    proportion_class_1 = mean(sampled_class == 1, na.rm = TRUE),
+    proportion_class_2 = mean(sampled_class == 2, na.rm = TRUE),
+    proportion_class_3 = mean(sampled_class == 3, na.rm = TRUE),
+    proportion_class_4 = mean(sampled_class == 4, na.rm = TRUE),
+    proportion_class_5 = mean(sampled_class == 5, na.rm = TRUE),
+    proportion_class_6 = mean(sampled_class == 6, na.rm = TRUE),
+    proportion_class_7 = mean(sampled_class == 7, na.rm = TRUE),
+    proportion_class_8 = mean(sampled_class == 8, na.rm = TRUE)
+  )
+
+med <- med %>%
+  group_by(draw_id) %>%
+  summarise(
+    proportion_class_1 = mean(sampled_class == 1, na.rm = TRUE),
+    proportion_class_2 = mean(sampled_class == 2, na.rm = TRUE),
+    proportion_class_3 = mean(sampled_class == 3, na.rm = TRUE),
+    proportion_class_4 = mean(sampled_class == 4, na.rm = TRUE),
+    proportion_class_5 = mean(sampled_class == 5, na.rm = TRUE),
+    proportion_class_6 = mean(sampled_class == 6, na.rm = TRUE),
+    proportion_class_7 = mean(sampled_class == 7, na.rm = TRUE),
+    proportion_class_8 = mean(sampled_class == 8, na.rm = TRUE)
+  )
+
+long <- long %>%
+  group_by(draw_id) %>%
+  summarise(
+    proportion_class_1 = mean(sampled_class == 1, na.rm = TRUE),
+    proportion_class_2 = mean(sampled_class == 2, na.rm = TRUE),
+    proportion_class_3 = mean(sampled_class == 3, na.rm = TRUE),
+    proportion_class_4 = mean(sampled_class == 4, na.rm = TRUE),
+    proportion_class_5 = mean(sampled_class == 5, na.rm = TRUE),
+    proportion_class_6 = mean(sampled_class == 6, na.rm = TRUE),
+    proportion_class_7 = mean(sampled_class == 7, na.rm = TRUE),
+    proportion_class_8 = mean(sampled_class == 8, na.rm = TRUE)
+  )
+
+# Estimate average and confidence interval
+early <- early %>% summarise(
+    average_proportion_class_1 = mean(proportion_class_1),
+    lower_ci_class_1 = quantile(proportion_class_1, 0.025),
+    upper_ci_class_1 = quantile(proportion_class_1, 0.975),
+    average_proportion_class_2 = mean(proportion_class_2),
+    lower_ci_class_2 = quantile(proportion_class_2, 0.025),
+    upper_ci_class_2 = quantile(proportion_class_2, 0.975),
+    average_proportion_class_3 = mean(proportion_class_3),
+    lower_ci_class_3 = quantile(proportion_class_3, 0.025),
+    upper_ci_class_3 = quantile(proportion_class_3, 0.975),
+    average_proportion_class_4 = mean(proportion_class_4),
+    lower_ci_class_4 = quantile(proportion_class_4, 0.025),
+    upper_ci_class_4 = quantile(proportion_class_4, 0.975),
+    average_proportion_class_5 = mean(proportion_class_5),
+    lower_ci_class_5 = quantile(proportion_class_5, 0.025),
+    upper_ci_class_5 = quantile(proportion_class_5, 0.975),
+    average_proportion_class_6 = mean(proportion_class_6),
+    lower_ci_class_6 = quantile(proportion_class_6, 0.025),
+    upper_ci_class_6 = quantile(proportion_class_6, 0.975),
+    average_proportion_class_7 = mean(proportion_class_7),
+    lower_ci_class_7 = quantile(proportion_class_7, 0.025),
+    upper_ci_class_7 = quantile(proportion_class_7, 0.975),
+    average_proportion_class_8 = mean(proportion_class_8),
+    lower_ci_class_8 = quantile(proportion_class_8, 0.025),
+    upper_ci_class_8 = quantile(proportion_class_8, 0.975),
+    .groups = "drop"
+  )
+
+med <- med %>% summarise(
+    average_proportion_class_1 = mean(proportion_class_1),
+    lower_ci_class_1 = quantile(proportion_class_1, 0.025),
+    upper_ci_class_1 = quantile(proportion_class_1, 0.975),
+    average_proportion_class_2 = mean(proportion_class_2),
+    lower_ci_class_2 = quantile(proportion_class_2, 0.025),
+    upper_ci_class_2 = quantile(proportion_class_2, 0.975),
+    average_proportion_class_3 = mean(proportion_class_3),
+    lower_ci_class_3 = quantile(proportion_class_3, 0.025),
+    upper_ci_class_3 = quantile(proportion_class_3, 0.975),
+    average_proportion_class_4 = mean(proportion_class_4),
+    lower_ci_class_4 = quantile(proportion_class_4, 0.025),
+    upper_ci_class_4 = quantile(proportion_class_4, 0.975),
+    average_proportion_class_5 = mean(proportion_class_5),
+    lower_ci_class_5 = quantile(proportion_class_5, 0.025),
+    upper_ci_class_5 = quantile(proportion_class_5, 0.975),
+    average_proportion_class_6 = mean(proportion_class_6),
+    lower_ci_class_6 = quantile(proportion_class_6, 0.025),
+    upper_ci_class_6 = quantile(proportion_class_6, 0.975),
+    average_proportion_class_7 = mean(proportion_class_7),
+    lower_ci_class_7 = quantile(proportion_class_7, 0.025),
+    upper_ci_class_7 = quantile(proportion_class_7, 0.975),
+    average_proportion_class_8 = mean(proportion_class_8),
+    lower_ci_class_8 = quantile(proportion_class_8, 0.025),
+    upper_ci_class_8 = quantile(proportion_class_8, 0.975),
+    .groups = "drop"
+  )
+
+long <- long %>% summarise(
+    average_proportion_class_1 = mean(proportion_class_1),
+    lower_ci_class_1 = quantile(proportion_class_1, 0.025),
+    upper_ci_class_1 = quantile(proportion_class_1, 0.975),
+    average_proportion_class_2 = mean(proportion_class_2),
+    lower_ci_class_2 = quantile(proportion_class_2, 0.025),
+    upper_ci_class_2 = quantile(proportion_class_2, 0.975),
+    average_proportion_class_3 = mean(proportion_class_3),
+    lower_ci_class_3 = quantile(proportion_class_3, 0.025),
+    upper_ci_class_3 = quantile(proportion_class_3, 0.975),
+    average_proportion_class_4 = mean(proportion_class_4),
+    lower_ci_class_4 = quantile(proportion_class_4, 0.025),
+    upper_ci_class_4 = quantile(proportion_class_4, 0.975),
+    average_proportion_class_5 = mean(proportion_class_5),
+    lower_ci_class_5 = quantile(proportion_class_5, 0.025),
+    upper_ci_class_5 = quantile(proportion_class_5, 0.975),
+    average_proportion_class_6 = mean(proportion_class_6),
+    lower_ci_class_6 = quantile(proportion_class_6, 0.025),
+    upper_ci_class_6 = quantile(proportion_class_6, 0.975),
+    average_proportion_class_7 = mean(proportion_class_7),
+    lower_ci_class_7 = quantile(proportion_class_7, 0.025),
+    upper_ci_class_7 = quantile(proportion_class_7, 0.975),
+    average_proportion_class_8 = mean(proportion_class_8),
+    lower_ci_class_8 = quantile(proportion_class_8, 0.025),
+    upper_ci_class_8 = quantile(proportion_class_8, 0.975),
+    .groups = "drop"
+  )
+
+
+# Compare the retrodictive classified result to the true classified result
+early_truth <- observed_results2 %>% filter(ajs_bin=="Early") %>% filter(is.na(case_type_gran)==FALSE) %>% tabyl(case_type_gran)
+med_truth <- observed_results2 %>% filter(ajs_bin=="Medium") %>% filter(is.na(case_type_gran)==FALSE) %>% tabyl(case_type_gran)
+long_truth <- observed_results2 %>% filter(ajs_bin=="Long") %>% filter(is.na(case_type_gran)==FALSE) %>% tabyl(case_type_gran)
+
+props_early_truth <- early_truth$percent
+props_med_truth <- med_truth$percent
+props_long_truth <- long_truth$percent
+
+compare_result_early <- data.frame(
+  result = c("PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+", "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+"),
+  proportion = c(props_early_truth[1], props_early_truth[2], props_early_truth[3], props_early_truth[4],  props_early_truth[5],  props_early_truth[6],  props_early_truth[7],  props_early_truth[8], early$average_proportion_class_1, early$average_proportion_class_2, early$average_proportion_class_3, early$average_proportion_class_4, early$average_proportion_class_5, early$average_proportion_class_6, early$average_proportion_class_7, early$average_proportion_class_8),
+  type = c("truth", "truth", "truth", "truth", "truth", "truth", "truth", "truth", "retro", "retro","retro", "retro", "retro", "retro", "retro", "retro"),
+  lower = c(NA, NA, NA, NA, NA, NA, NA, NA, early$lower_ci_class_1, early$lower_ci_class_2, early$lower_ci_class_3, early$lower_ci_class_4, early$lower_ci_class_5, early$lower_ci_class_6, early$lower_ci_class_7, early$lower_ci_class_8),
+  upper = c(NA, NA, NA, NA, NA, NA, NA, NA, early$upper_ci_class_1, early$upper_ci_class_2, early$upper_ci_class_3, early$upper_ci_class_4, early$upper_ci_class_5, early$upper_ci_class_6, early$upper_ci_class_7, early$upper_ci_class_8))
+
+
+compare_result_med <- data.frame(
+  result = c("PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+", "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+"),
+  proportion = c(props_med_truth[1], props_med_truth[2], props_med_truth[3], props_med_truth[4],  props_med_truth[5],  props_med_truth[6],  props_med_truth[7],  props_med_truth[8], med$average_proportion_class_1, med$average_proportion_class_2, med$average_proportion_class_3, med$average_proportion_class_4, med$average_proportion_class_5, med$average_proportion_class_6, med$average_proportion_class_7, med$average_proportion_class_8),
+  type = c("truth", "truth", "truth", "truth", "truth", "truth", "truth", "truth", "retro", "retro","retro", "retro", "retro", "retro", "retro", "retro"),
+  lower = c(NA, NA, NA, NA, NA, NA, NA, NA, med$lower_ci_class_1, med$lower_ci_class_2, med$lower_ci_class_3, med$lower_ci_class_4, med$lower_ci_class_5, med$lower_ci_class_6, med$lower_ci_class_7, med$lower_ci_class_8),
+  upper = c(NA, NA, NA, NA, NA, NA, NA, NA, med$upper_ci_class_1, med$upper_ci_class_2, med$upper_ci_class_3, med$upper_ci_class_4, med$upper_ci_class_5, med$upper_ci_class_6, med$upper_ci_class_7, med$upper_ci_class_8))
+
+compare_result_long <- data.frame(
+  result = c("PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+", "PCR-,RDT-,ELISA-","PCR-,RDT-,ELISA+", "PCR-,RDT+,ELISA-", "PCR-,RDT+,ELISA+", "PCR+,RDT-,ELISA-", "PCR+,RDT-,ELISA+", "PCR+,RDT+,ELISA-", "PCR+,RDT+,ELISA+"),
+  proportion = c(props_long_truth[1], props_long_truth[2], props_long_truth[3], props_long_truth[4],  props_long_truth[5],  props_long_truth[6],  props_long_truth[7],  props_long_truth[8], long$average_proportion_class_1, long$average_proportion_class_2, long$average_proportion_class_3, long$average_proportion_class_4, long$average_proportion_class_5, long$average_proportion_class_6, long$average_proportion_class_7, long$average_proportion_class_8),
+  type = c("truth", "truth", "truth", "truth", "truth", "truth", "truth", "truth", "retro", "retro","retro", "retro", "retro", "retro", "retro", "retro"),
+  lower = c(NA, NA, NA, NA, NA, NA, NA, NA, long$lower_ci_class_1, long$lower_ci_class_2, long$lower_ci_class_3, long$lower_ci_class_4, long$lower_ci_class_5, long$lower_ci_class_6, long$lower_ci_class_7, long$lower_ci_class_8),
+  upper = c(NA, NA, NA, NA, NA, NA, NA, NA, long$upper_ci_class_1, long$upper_ci_class_2, long$upper_ci_class_3, long$upper_ci_class_4, long$upper_ci_class_5, long$upper_ci_class_6, long$upper_ci_class_7, long$upper_ci_class_8))
+
+
+# # Create a plot
+compare_result_early_plot <- ggplot(compare_result_early, aes(x = as.factor(result), y = proportion, color = factor(type))) +
+  geom_point(size = 3, position=position_dodge(width=0.5)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),  # Add error bars for the confidence intervals
+    width = 0,
+    position=position_dodge(width=0.5)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 30, size=5), 
+    plot.title = element_text(size = 8, hjust = 0.5),  # Center the title
+    plot.title.position = "panel",  # Position the title within the plot panel
+    legend.title = element_blank()) + 
+  labs(x = "", y = "Proportion of sample") + 
+  scale_color_discrete(labels = c('Retrodiction', 'Observed Data')) + 
+  ggtitle("≤ 7 days between jaundice onset and careseeking") + ylim(0,0.8)
+
+compare_result_med_plot <- ggplot(compare_result_med, aes(x = as.factor(result), y = proportion, color = factor(type))) +
+  geom_point(size = 3, position=position_dodge(width=0.5)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),  # Add error bars for the confidence intervals
+    width = 0,
+    position=position_dodge(width=0.5)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 30, size=5), 
+    plot.title = element_text(size = 8, hjust = 0.5),  # Center the title
+    plot.title.position = "panel",  # Position the title within the plot panel
+    legend.title = element_blank()) + 
+  labs(x = "", y = "Proportion of sample") + 
+  scale_color_discrete(labels = c('Retrodiction', 'Observed Data')) + 
+  ggtitle("8-21 days between jaundice onset and careseeking") + ylim(0,0.8)
+
+compare_result_long_plot <- ggplot(compare_result_long, aes(x = as.factor(result), y = proportion, color = factor(type))) +
+  geom_point(size = 3, position=position_dodge(width=0.5)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),  # Add error bars for the confidence intervals
+    width = 0, position=position_dodge(width=0.5)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 30, size=5), 
+    plot.title = element_text(size = 8, hjust = 0.5),  # Center the title
+    plot.title.position = "panel",  # Position the title within the plot panel
+    legend.title = element_blank()) + 
+  labs(x = "", y = "Proportion of sample") + 
+  scale_color_discrete(labels = c('Retrodiction', 'Observed Data')) + 
+  ggtitle("≥ 22 days between jaundice onset and careseeking") + ylim(0,0.8)
+
+compare_result_long_plot
+
+# Put all 3 plots together
+
+# Extract the common legend from one of the plots (e.g., compare_result_early_plot)
+legend <- get_legend(compare_result_early_plot)
+
+# Remove legends from all plots
+compare_result_early_plot <- compare_result_early_plot + theme(legend.position = "none")
+compare_result_med_plot <- compare_result_med_plot + theme(legend.position = "none")
+compare_result_long_plot <- compare_result_long_plot + theme(legend.position = "none")
+
+# Combine the three plots into one grid
+library(cowplot)
+
+compare_result_full <- plot_grid(
+  compare_result_early_plot, 
+  compare_result_med_plot, 
+  compare_result_long_plot, 
+  ncol = 1, 
+  rel_heights = c(1, 1, 1))  # Adjust the relative heights of the plots (optional)
+
+# Add the common legend to the combined plot
+final_plot <- plot_grid(compare_result_full, legend, ncol = 2, rel_widths = c(0.85, 0.15))  # Adjust width for the legend
+
+# Display the final plot with the common legend
+final_plot
+
+```
+
+Look at curves in m1t with age interaction:
+```{r fit_m1t_age}
+
+# Load model
+fit_m19t <- readRDS(here("scripts/Diagnostics/fit_m19t.rds"))
+
+# Process draws
+draws_m19t <- as.data.frame(fit_m19t)
+draws_m19t <- process_draws_time(draws_m19t)
+
+
+# Look at curves
+num_draws <- 1000
+N <- nrow(observed_results2)  
+num_tests <- 3  
+max_days <- 365
+days_pred <- (0:365)
+
+# Extract posterior draws
+intercept_sens_m19t <- draws_m19t %>%
+  select(starts_with("intercept_sens"))
+
+onset_coefs_m19 <-  draws_m19t %>%
+  select(starts_with("onset_coef_sens"))
+
+age_coefs_m19 <- draws_m19t %>% select(starts_with("age_coef_sens"))
+
+age_onset_coefs_m19 <- draws_m19t %>% select(starts_with("age_days_coef_sens"))
+
+# Initialize pred_sens_draws_m2 array
+pred_sens_draws_m19t <- array(NA, dim = c(num_draws, max_days + 1, num_tests, 2)) # added the 2 for the 2 age groups
+
+# Loop through each draw and test combination
+for (draw in 1:num_draws) {
+  for (test in 1:num_tests) {
+    
+    # Predict for under 5 (age = 1) group
+    logit_sens_pred_under5 <- as.numeric(intercept_sens_m19t[draw, test]) + 
+      days_pred * as.numeric(onset_coefs_m19[draw, test]) + 
+      as.numeric(age_coefs_m19[draw, test]) + days_pred*as.numeric(age_onset_coefs_m19[draw, test])  # Add age effect for under 5. Interaction is just with days multiplied by 1
+    
+    # Predict for over 5 (age = 0) group (no age effect added, no interaction)
+    logit_sens_pred_over5 <- as.numeric(intercept_sens_m19t[draw, test]) + 
+      days_pred * as.numeric(onset_coefs_m19[draw, test])  # No age effect for over 5, no interaction effect
+    
+    # Store predicted sensitivity after applying the inverse logit transform for both age groups
+    pred_sens_draws_m19t[draw, , test, 1] <- inverse_logit_transform(logit_sens_pred_under5)  # Under 5
+    pred_sens_draws_m19t[draw, , test, 2] <- inverse_logit_transform(logit_sens_pred_over5)  # Over 5
+  }
+}
+
+# Convert to a dataframe
+pred_sens_df_m19t <- melt(array(pred_sens_draws_m19t, dim = c(num_draws, max_days + 1, num_tests, 2)),
+                          varnames = c("Draw", "Day", "Test", "Age_group"),
+                          value.name = "Sensitivity")
+
+
+pred_sens_df_m19t$Day <- pred_sens_df_m19t$Day - 1
+
+# Calculate quantiles for each day and test
+quantiles_df_m19t <- pred_sens_df_m19t %>%
+  group_by(Test, Age_group, Day) %>%
+  summarize(
+    Median = median(Sensitivity),
+    Q2_5 = quantile(Sensitivity, 0.025),
+    Q20 = quantile(Sensitivity, 0.20),
+    Q80 = quantile(Sensitivity, 0.80),
+    Q97_5 = quantile(Sensitivity, 0.975),
+    .groups = "drop"  # Drop grouping after summarizing
+  ) %>%
+  ungroup()
+
+# Make age a factor variable so I can change order
+quantiles_df_m19t$Age_group <- factor(quantiles_df_m19t$Age_group, 
+                                      levels = c("1", "2"), 
+                                      labels = c("Under 5", "Over 5"))
+
+# Plot 
+library(ggnewscale)  # Allows multiple scales for the same aesthetic
+
+plot_pcr_m19t <- ggplot() +   
+  # Ribbon for Under 5 (Age_group == 1)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Under 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Under 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Under 5"), 
+            aes(x = Day, y = Median, color = "Under 5"), linewidth = 1) +  
+
+  # Ribbon for Over 5 (Age_group == 2)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Over 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Over 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Over 5"), 
+            aes(x = Day, y = Median, color = "Over 5"), linewidth = 1) +  
+  # Labels and theme
+  labs(x = "", y = "PCR Sensitivity", color = "Age Group", fill = "Age Group") +  
+  theme_minimal() +  
+  ylim(0, 1) +  
+  xlim(0, 300) +  
+  # Custom color and fill scales for age groups
+  scale_color_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  scale_fill_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  # Allow a new color scale for the rug plot  
+  new_scale_color() +  
+  # Rug plot for observed results
+  geom_rug(data = observed_results2, 
+           aes(x = days_since_ajs, color = factor(indicat), alpha = freq), 
+           sides = "b") +  
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  # Separate scale for Enrollment and Follow-up
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#74F3D3FF"),
+    labels = c("Enrollment", "Follow-up"),
+    name = NULL,  # Remove the title
+    guide = guide_legend(override.aes = list(fill = NA, color = c("#468892FF", "#74F3D3FF")))  # Remove grey box around legend items
+  ) +  
+  # Legend positioning and plot title
+  theme(legend.position = "bottom", plot.title = element_text(size = 10)) + ggtitle("A")
+
+plot_pcr_m19t
+
+plot_rdt_m19t <- ggplot() +   
+  # Ribbon for Under 5 (Age_group == 1)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Under 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Under 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Under 5"), 
+            aes(x = Day, y = Median, color = "Under 5"), linewidth = 1) +  
+
+  # Ribbon for Over 5 (Age_group == 2)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Over 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Over 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Over 5"), 
+            aes(x = Day, y = Median, color = "Over 5"), linewidth = 1) +  
+  # Labels and theme
+  labs(x = "", y = "RDT Sensitivity", color = "Age Group", fill = "Age Group") +  
+  theme_minimal() +  
+  ylim(0, 1) +  
+  xlim(0, 300) +  
+  # Custom color and fill scales for age groups
+  scale_color_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  scale_fill_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  # Allow a new color scale for the rug plot  
+  new_scale_color() +  
+  # Rug plot for observed results
+  geom_rug(data = observed_results2, 
+           aes(x = days_since_ajs, color = factor(indicat), alpha = freq), 
+           sides = "b") +  
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  # Separate scale for Enrollment and Follow-up
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#74F3D3FF"),
+    labels = c("Enrollment", "Follow-up"),
+    name = NULL,  # Remove the title
+    guide = guide_legend(override.aes = list(fill = NA, color = c("#468892FF", "#74F3D3FF")))  # Remove grey box around legend items
+  ) +  
+  # Legend positioning and plot title
+  theme(legend.position = "bottom", plot.title = element_text(size = 10)) + ggtitle("C")
+
+plot_rdt_m19t
+
+plot_elisa_m19t <- ggplot() +   
+  # Ribbon for Under 5 (Age_group == 1)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Under 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Under 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Under 5"), 
+            aes(x = Day, y = Median, color = "Under 5"), linewidth = 1) +  
+
+  # Ribbon for Over 5 (Age_group == 2)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Over 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Over 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Over 5"), 
+            aes(x = Day, y = Median, color = "Over 5"), linewidth = 1) +  
+  # Labels and theme
+  labs(x = "", y = "ELISA Sensitivity", color = "Age Group", fill = "Age Group") +  
+  theme_minimal() +  
+  ylim(0, 1) +  
+  xlim(0, 300) +  
+  # Custom color and fill scales for age groups
+  scale_color_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  scale_fill_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  # Allow a new color scale for the rug plot  
+  new_scale_color() +  
+  # Rug plot for observed results
+  geom_rug(data = observed_results2, 
+           aes(x = days_since_ajs, color = factor(indicat), alpha = freq), 
+           sides = "b") +  
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  # Separate scale for Enrollment and Follow-up
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#74F3D3FF"),
+    labels = c("Enrollment", "Follow-up"),
+    name = NULL,  # Remove the title
+    guide = guide_legend(override.aes = list(fill = NA, color = c("#468892FF", "#74F3D3FF")))  # Remove grey box around legend items
+  ) +  
+  # Legend positioning and plot title
+  theme(legend.position = "bottom", plot.title = element_text(size = 10)) + ggtitle("E")
+
+plot_elisa_m19t
+
+# Truncated at 30 days
+
+plot_pcr_m19t_30 <- ggplot() +   
+  # Ribbon for Under 5 (Age_group == 1)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Under 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Under 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Under 5"), 
+            aes(x = Day, y = Median, color = "Under 5"), linewidth = 1) +  
+  # Ribbon for Over 5 (Age_group == 2)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Over 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Over 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 1, `Age_group` == "Over 5"), 
+            aes(x = Day, y = Median, color = "Over 5"), linewidth = 1) +  
+  # Labels and theme
+  labs(x = "", y = "PCR Sensitivity", color = "Age Group", fill = "Age Group") +  
+  theme_minimal() +  
+  ylim(0, 1) +  
+  xlim(0, 30) +  
+  # Custom color and fill scales for age groups
+  scale_color_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  scale_fill_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  # Allow a new color scale for the rug plot  
+  new_scale_color() +  
+  # Rug plot for observed results
+  geom_rug(data = observed_results2, 
+           aes(x = days_since_ajs, color = factor(indicat), alpha = freq), 
+           sides = "b") +  
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  # Separate scale for Enrollment and Follow-up
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#74F3D3FF"),
+    labels = c("Enrollment", "Follow-up"),
+    name = NULL,  # Remove the title
+    guide = guide_legend(override.aes = list(fill = NA, color = c("#468892FF", "#74F3D3FF")))  # Remove grey box around legend items
+  ) +  
+  # Legend positioning and plot title
+  theme(legend.position = "bottom", plot.title = element_text(size = 10)) + ggtitle("B")
+
+plot_pcr_m19t_30
+
+plot_rdt_m19t_30 <- ggplot() +   
+  # Ribbon for Under 5 (Age_group == 1)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Under 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Under 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Under 5"), 
+            aes(x = Day, y = Median, color = "Under 5"), linewidth = 1) +  
+
+  # Ribbon for Over 5 (Age_group == 2)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Over 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Over 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 2, `Age_group` == "Over 5"), 
+            aes(x = Day, y = Median, color = "Over 5"), linewidth = 1) +  
+  # Labels and theme
+  labs(x = "", y = "RDT Sensitivity", color = "Age Group", fill = "Age Group") +  
+  theme_minimal() +  
+  ylim(0, 1) +  
+  xlim(0, 30) +  
+  # Custom color and fill scales for age groups
+  scale_color_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  scale_fill_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  # Allow a new color scale for the rug plot  
+  new_scale_color() +  
+  # Rug plot for observed results
+  geom_rug(data = observed_results2, 
+           aes(x = days_since_ajs, color = factor(indicat), alpha = freq), 
+           sides = "b") +  
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  # Separate scale for Enrollment and Follow-up
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#74F3D3FF"),
+    labels = c("Enrollment", "Follow-up"),
+    name = NULL,  # Remove the title
+    guide = guide_legend(override.aes = list(fill = NA, color = c("#468892FF", "#74F3D3FF")))  # Remove grey box around legend items
+  ) +  
+  # Legend positioning and plot title
+  theme(legend.position = "bottom", plot.title = element_text(size = 10)) + ggtitle("D")
+
+plot_rdt_m19t_30
+
+plot_elisa_m19t_30 <- ggplot() +   
+  # Ribbon for Under 5 (Age_group == 1)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Under 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Under 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Under 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Under 5"), 
+            aes(x = Day, y = Median, color = "Under 5"), linewidth = 1) +  
+  # Ribbon for Over 5 (Age_group == 2)
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q2_5, ymax = Q97_5, fill = "Over 5"), alpha = 0.2, show.legend = TRUE) +  
+  geom_ribbon(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Over 5"), 
+              aes(x = Day, ymin = Q20, ymax = Q80, fill = "Over 5"), alpha = 0.4, show.legend = FALSE) +  
+  geom_line(data = quantiles_df_m19t %>% filter(Test == 3, `Age_group` == "Over 5"), 
+            aes(x = Day, y = Median, color = "Over 5"), linewidth = 1) +  
+  # Labels and theme
+  labs(x = "", y = "ELISA Sensitivity", color = "Age Group", fill = "Age Group") +  
+  theme_minimal() +  
+  ylim(0, 1) +  
+  xlim(0, 30) +  
+  # Custom color and fill scales for age groups
+  scale_color_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  scale_fill_manual(
+    values = c("Under 5" = "#751C6DFF", "Over 5" = "#FDC067FF"),
+    name = "Age Group",
+    breaks = c("Under 5", "Over 5")
+  ) +  
+  # Allow a new color scale for the rug plot  
+  new_scale_color() +  
+  # Rug plot for observed results
+  geom_rug(data = observed_results2, 
+           aes(x = days_since_ajs, color = factor(indicat), alpha = freq), 
+           sides = "b") +  
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  # Separate scale for Enrollment and Follow-up
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#74F3D3FF"),
+    labels = c("Enrollment", "Follow-up"),
+    name = NULL,  # Remove the title
+    guide = guide_legend(override.aes = list(fill = NA, color = c("#468892FF", "#74F3D3FF")))  # Remove grey box around legend items
+  ) +  
+  # Legend positioning and plot title
+  theme(legend.position = "bottom", plot.title = element_text(size = 10)) + ggtitle("F")
+
+plot_elisa_m19t_30
+
+# Put it all together
+
+# Arrange plots without individual legends
+fig1_age <- plot_grid(
+  plot_pcr_m19t + theme(legend.position = "none"),
+  plot_pcr_m19t_30 + theme(legend.position = "none"),
+  plot_rdt_m19t + theme(legend.position = "none"),
+  plot_rdt_m19t_30 + theme(legend.position = "none"),
+  plot_elisa_m19t + theme(legend.position = "none"),
+  plot_elisa_m19t_30 + theme(legend.position = "none"),
+  ncol = 2,
+  nrow = 3,
+  rel_widths = c(1, 1, 1)
+)
+
+fig1_final_age <- plot_grid(fig1_age, ncol = 1, rel_heights = c(3, 0.4)) 
+
+```
+
+Look at the curves in the cubic spline model
+
+```{r m2t}
+
+# Load model
+fit_m2t <- readRDS(here("scripts/Diagnostics/fit_m2t.rds"))
+
+# Process draws
+draws_m19t <- as.data.frame(fit_m19t)
+draws_m19t <- process_draws_time(draws_m19t)
+
+
+num_draws <- 1000
+N <- nrow(observed_results2)  
+num_tests <- 3  
+max_days <- 365
+spline_basis_pred <- poly(0:max_days, degree = 3, raw = TRUE)
+
+# Extract posterior draws
+intercept_sens_m2t <- draws_m2_t %>%
+  select(starts_with("intercept_sens"))
+   
+spline_coefs_m2t <-  draws_m2_t %>%
+  select(starts_with("spline_coef_sens"))
+
+spline_coefs_m2t <- spline_coefs_m2t %>% dplyr::rename(spline1_sens1 = `spline_coef_sens[1,1]`,
+                                              spline2_sens1 = `spline_coef_sens[1,2]`,
+                                              spline3_sens1 = `spline_coef_sens[1,3]`)
+
+spline_coefs_m2t <- spline_coefs_m2t %>% dplyr::rename(spline1_sens2 = `spline_coef_sens[2,1]`,
+                                              spline2_sens2 = `spline_coef_sens[2,2]`,
+                                              spline3_sens2 = `spline_coef_sens[2,3]`)
+
+spline_coefs_m2t <- spline_coefs_m2t %>% dplyr::rename(spline1_sens3 = `spline_coef_sens[3,1]`,
+                                              spline2_sens3 = `spline_coef_sens[3,2]`,
+                                              spline3_sens3 = `spline_coef_sens[3,3]`)
+
+
+# Initialize pred_sens_draws_m2 array
+pred_sens_draws_m2t <- array(NA, dim = c(num_draws, max_days + 1, num_tests))
+
+# Loop through each draw and test combination
+for (draw in 1:num_draws) {
+  for (test in 1:num_tests) {
+    # Extract spline coefficients for the current test
+    spline_coefficients <- as.numeric(spline_coefs_m2t[draw, paste0("spline", 1:3, "_sens", test)])
+
+  # Calculate predicted sensitivity using spline coefficients and intercept for all days at once
+    logit_sens_pred <- as.numeric(intercept_sens_m2t[draw, test]) +
+                       spline_basis_pred %*% spline_coefficients
+
+    # Store predicted sensitivity after applying the inverse logit transform
+    pred_sens_draws_m2t[draw, , test] <- inverse_logit_transform(logit_sens_pred)
+  }
+}
+
+# Convert to a dataframe
+pred_sens_df_m2t <- melt(array(pred_sens_draws_m2t, dim = c(num_draws, max_days + 1, num_tests)),
+                        varnames = c("Draw", "Day", "Test"),
+                        value.name = "Sensitivity")
+
+
+pred_sens_df_m2t$Day <- pred_sens_df_m2t$Day - 1
+
+# Calculate quantiles for each day and test
+quantiles_df_m2t <- pred_sens_df_m2t %>%
+  group_by(Test, Day) %>%
+  summarize(
+    Median = median(Sensitivity),
+    Q2_5 = quantile(Sensitivity, 0.025),
+    Q20 = quantile(Sensitivity, 0.20),
+    Q80 = quantile(Sensitivity, 0.80),
+    Q97_5 = quantile(Sensitivity, 0.975)
+  ) %>%
+  ungroup()
+
+# Plot 
+plot_pcr_m2t <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==1), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==1), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m2t %>% filter(Test==1), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "PCR Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  # Adding rug plot with alpha mapped to frequency
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1)) + xlim(0,300) + 
+  theme(legend.position="none") + geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  theme(legend.position="right", plot.title = element_text(size = 10)) +   geom_rect(aes(xmin = 0, xmax = 30, ymin = 0, ymax = 1), fill = NA, color = "black", linetype = "dashed", size = 0.2) + ggtitle("A")
+
+plot_pcr_m2t
+
+plot_rdt_m2t <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==2), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==2), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m2t %>% filter(Test==2), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "RDT Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  # Adding rug plot with alpha mapped to frequency
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1)) + xlim(0,200) + 
+  theme(legend.position="none") + geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,300) + 
+  theme(legend.position="right", plot.title = element_text(size = 10)) + geom_rect(aes(xmin = 0, xmax = 30, ymin = 0, ymax = 1), fill = NA, color = "black", linetype = "dashed", size = 0.2) + ggtitle("C")
+
+plot_rdt_m2t
+
+plot_elisa_m2t <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==3), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==3), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m2t %>% filter(Test==3), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "ELISA Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1)  + geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,300) + 
+  theme(legend.position="right", plot.title = element_text(size = 10)) + geom_rect(aes(xmin = 0, xmax = 30, ymin = 0, ymax = 1), fill = NA, color = "black", linetype = "dashed", size = 0.2) + ggtitle("E")
+
+plot_elisa_m2t
+
+# Truncated at 30 days
+plot_pcr_m2t_30 <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==1), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==1), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m2t %>% filter(Test==1), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "PCR Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,30) + 
+  theme(legend.position="none", plot.title = element_text(size = 10)) + ggtitle("B")
+
+plot_pcr_m2t_30
+
+plot_rdt_m2t_30 <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==2), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==2), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m2t %>% filter(Test==2), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "RDT Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,30) + 
+  theme(legend.position="none", plot.title = element_text(size = 10)) + ggtitle("D")
+
+plot_rdt_m2t_30
+
+plot_elisa_m2t_30 <- ggplot() +
+  # Adding 2.5/97.5th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==3), aes(x = Day, ymin = Q2_5, ymax = Q97_5), fill="#751C6DFF", alpha = 0.2) + 
+  # Adding 20/80th quantile ribbon
+  geom_ribbon(data = quantiles_df_m2t %>% filter(Test==3), aes(x = Day, ymin = Q20, ymax = Q80), fill="#751C6DFF", alpha = 0.4) +
+  geom_line(data = quantiles_df_m2t %>% filter(Test==3), aes(x = Day, y = Median), color = "black") +
+  labs(x = "", y = "ELISA Sensitivity") + 
+  theme_minimal() + 
+  ylim(0,1) + 
+  geom_rug(data = observed_results2, aes(x = days_since_ajs, color = factor(indicat), alpha = freq), sides = "b") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Remove legend for alpha
+  scale_color_manual(
+    values = c("0" = "#468892FF", "1" = "#FDC067FF"), 
+    labels = c("Enrollment", "Follow-up"),  # Change legend labels
+    name = NULL  # Remove the title
+  ) +  
+  xlim(0,30) + 
+  theme(legend.position="none", plot.title = element_text(size = 10)) + ggtitle("F")
+
+plot_elisa_m2t_30
+
+# Put it all together
+common_legend <- get_legend(plot_pcr_m2t + theme(legend.position = "right"))
+
+# Arrange plots without individual legends
+fig1_splines <- plot_grid(
+  plot_pcr_m2t + theme(legend.position = "none"),
+  plot_pcr_m2t_30 + theme(legend.position = "none"),
+  plot_rdt_m2t + theme(legend.position = "none"),
+  plot_rdt_m2t_30 + theme(legend.position = "none"),
+  plot_elisa_m2t + theme(legend.position = "none"),
+  plot_elisa_m2t_30 + theme(legend.position = "none"),
+  ncol = 2,
+  nrow = 3,
+  rel_widths = c(1, 1, 1)
+)
+
+# Add the common legend below
+fig1_final_splines <- plot_grid(fig1_splines, common_legend, ncol = 1, rel_heights = c(3, 0.4)) 
+ggsave("fig1_final_splines.pdf")
+
+```
