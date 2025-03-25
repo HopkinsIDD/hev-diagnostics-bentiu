@@ -1,1 +1,1 @@
-# hev-diagnostics-bentiu
+This is the repository for code and data from “Performance of rapid and conventional diagnostic tests for hepatitis E: insights from a field evaluation in Bentiu, South Sudan”. You will find R and STAN code needed to regenerate the primary analyses as well as all sensitivity analyses. If you have any questions, please log an issues in GitHub and we will reply as soon as possible. 
