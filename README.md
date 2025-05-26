@@ -5,5 +5,6 @@ This is the repository for code and data from “Performance of rapid and conven
 
 
 STAN code corresponds to the final models: 
-![image](https://github.com/user-attachments/assets/8ce448b7-3b87-4a19-9697-656ce008b662)
+![image](https://github.com/user-attachments/assets/c15ed6dd-19c1-43fa-ad18-da95b1305681)
+
 
