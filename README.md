@@ -4,7 +4,7 @@ This is the repository for code and data from “Performance of rapid and conven
 Latent class models are run using both R code (Public_code_latent_models.Rmd and Public_code_latent_outputs.Rmd) and STAN code (see below), while accelerated failure time models are run exclusively using R code (Public_code_AFT.Rmd).
 
 STAN code corresponds to the following models: 
-![image](Summary_table.pdf)
+![image](https://github.com/HopkinsIDD/hev-diagnostics-bentiu/blob/98d041f37c24bd0e88a557609fb05dc6789bba2f/Summary_table.pdf)
 
 
 The main analyses presented in the manuscript correspond to model m1_time. 
